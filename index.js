@@ -144,6 +144,12 @@ app.get('/take', (req, res) => {
   res.redirect('/format');
 });
 
+// Legacy POST /take endpoint: forward body to /format for backward compatibility.
+// Some older clients may still submit to /take; use a 307 redirect to preserve POST body.
+app.post('/take', (req, res) => {
+  res.redirect(307, '/format');
+});
+
 // Utility to fetch next usernames for a model
 async function fetchUsernames(model, count) {
   const docs = await Username.find({ used_by: { $ne: model } })
