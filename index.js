@@ -3,33 +3,57 @@ const express = require('express');
 const mongoose = require('mongoose');
 const multer = require('multer');
 const session = require('express-session');
-const fs = require('fs');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const bcrypt = require('bcrypt');
+
+const path = require('path');
 
 // ===== ENV =====
 const {
   MONGO_URL,
   PORT = 3000,
   SESSION_SECRET = 'change-me-please',
+  USER_PASSWORD = 'Blue@magicTeam!7',
+  ADMIN_PASSWORD = 'Nigwedeek217',
+  NODE_ENV = 'development',
 } = process.env;
 
-// ===== CONSTANTS (Passwords) =====
-const USER_PASSWORD = 'Blue@magicTeam!7';
-const ADMIN_PASSWORD = 'Nigwedeek217';
+const IS_PROD = NODE_ENV === 'production';
+
+// ===== CONSTANTS =====
 const CLEAR_CONFIRM_TEXT = 'I confirm to clear Database';
+const PRESENCE_TTL_MS = 60 * 1000; // show as online if pinged in last 60s
 
 // ===== APP INIT =====
 const app = express();
-app.use(express.urlencoded({ extended: true }));
+
+// Security headers
+app.use(helmet({ contentSecurityPolicy: false }));
+// Basic rate limit (per IP)
+app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 800 }));
+
+app.use(express.urlencoded({ extended: true, limit: '5mb' }));
+app.use(express.json({ limit: '5mb' }));
 
 // sessions (one-time login per browser session)
+app.set('trust proxy', 1); // for secure cookies behind proxy
 app.use(
   session({
     secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    cookie: { httpOnly: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 * 12 }, // 12h
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: IS_PROD, // true in prod (behind https)
+      maxAge: 1000 * 60 * 60 * 12, // 12h
+    },
   })
 );
+
+// Static for branding assets (favicon / logo)
+app.use('/static', express.static(path.join(__dirname, 'static')));
 
 // Multer for .txt uploads from memory
 const upload = multer({ storage: multer.memoryStorage() });
@@ -43,79 +67,157 @@ mongoose
     process.exit(1);
   });
 
+// --- Schemas
 const usernameSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true, trim: true },
   date_added: { type: Date, default: Date.now },
   used_by: { type: [String], default: [] }, // models that used this username
+  last_used_at: { type: Date, default: null },
+  last_used_by: { type: String, default: null },
 });
 
 const logSchema = new mongoose.Schema({
   ts: { type: Date, default: Date.now },
-  actor: { type: String, enum: ['user', 'admin'], default: 'user' },
+  actor_type: { type: String, enum: ['user', 'admin', 'va'], default: 'user' },
+  actor_name: { type: String, default: null }, // VA name
   action: { type: String, required: true },
   details: { type: Object, default: {} },
 });
 
+const modelSchema = new mongoose.Schema({
+  name: { type: String, unique: true, required: true, trim: true },
+  created_at: { type: Date, default: Date.now },
+});
+
+const vaSchema = new mongoose.Schema({
+  name: { type: String, unique: true, required: true, trim: true },
+  password_hash: { type: String, required: true },
+  created_at: { type: Date, default: Date.now },
+});
+
+// “Take” activity to support revert/KPI
+const activitySchema = new mongoose.Schema({
+  ts: { type: Date, default: Date.now },
+  model: { type: String, required: true },
+  va: { type: String, default: null }, // null if generic user
+  accounts: { type: Number, required: true }, // A
+  per_line: { type: Number, required: true },   // B
+  total_usernames: { type: Number, required: true }, // A * B actually assigned
+  username_ids: { type: [mongoose.Schema.Types.ObjectId], default: [] },
+  undone: { type: Boolean, default: false },
+});
+
 const Username = mongoose.model('Username', usernameSchema);
 const Log = mongoose.model('Log', logSchema);
+const Model = mongoose.model('Model', modelSchema);
+const VAUser = mongoose.model('VAUser', vaSchema);
+const Activity = mongoose.model('Activity', activitySchema);
+
+// ===== Presence (in-memory) =====
+const presence = new Map(); // sessionID -> { name, when }
 
 // ===== UTIL =====
-function renderPage(title, content, opts = {}) {
-  const { sessionUser = {}, showAdminNav = false } = opts;
-  const nav = `
-    <nav class="nav">
-      ${sessionUser.loggedIn ? `<a href="/add">Import</a>
-      <a href="/format">Format & Take</a>` : ''}
-      ${sessionUser.isAdmin ? `<a href="/admin">Admin</a>` : ''}
-      ${sessionUser.loggedIn ? `<a href="/logout">Logout</a>` : ''}
-    </nav>`;
-
+function pageHead(title) {
+  // favicon: we’ll serve /static/favicon.ico; see setup note below
+  return `
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${title} • BlueMagic</title>
+    <link rel="icon" type="image/png" href="/static/favicon.png" />
+    <style>
+      :root { color-scheme: dark; }
+      body { font-family: Inter, system-ui, -apple-system, Segoe UI, Arial, sans-serif; background:#0e1320; color:#e8ebf5; margin:0; }
+      .container { max-width: 1000px; margin: 0 auto; padding: 24px; }
+      header { display:flex; align-items:center; gap:12px; margin-bottom:16px; }
+      header img.logo { width:32px; height:32px; border-radius:6px; }
+      h1 { margin: 6px 0 16px; font-size: 22px; }
+      h2 { margin: 24px 0 12px; font-size: 18px; }
+      nav { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px; }
+      nav a { color:#9ec1ff; text-decoration:none; background:#131a33; padding:8px 10px; border:1px solid #223064; border-radius:8px; }
+      form { display:grid; gap:10px; margin-bottom:20px; }
+      label { font-size:13px; opacity:0.9; }
+      input, select, button, textarea {
+        padding:10px; border-radius:8px; border:1px solid #2a3766; background:#111834; color:#e8ebf5;
+      }
+      textarea { min-height: 240px; white-space: pre; }
+      button { background: linear-gradient(180deg, #6a0dad, #52118e); border:none; cursor:pointer; font-weight:600; }
+      button:hover { filter: brightness(1.06); }
+      .row { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
+      .notice { padding:12px; background:#0f172f; border:1px solid #223064; border-radius:8px; }
+      .card { padding:16px; background:#0e152b; border:1px solid #223064; border-radius:12px; }
+      table { width:100%; border-collapse:collapse; }
+      th, td { border-bottom:1px solid #223064; padding:8px; text-align:left; font-size:13px; }
+      .danger { background: linear-gradient(180deg, #d64b4b, #a52929); }
+      .muted { opacity:0.8; font-size:12px; }
+      .presence { position:fixed; right:12px; bottom:12px; padding:10px; background:#0f172f; border:1px solid #223064; border-radius:10px; font-size:12px; min-width:160px;}
+      .presence h4 { margin:0 0 6px; font-size:12px; opacity:.8; }
+      .kpi-pill { display:inline-block; padding:4px 8px; border:1px solid #223064; border-radius:999px; margin-right:6px; margin-bottom:6px; }
+      .actions { display:flex; gap:8px; flex-wrap: wrap; }
+    </style>
+  `;
+}
+function renderPage(title, content, req) {
+  const nav = req.session?.loggedIn
+    ? `<nav>
+        <a href="/add">Import</a>
+        <a href="/format">Format & Take</a>
+        <a href="/revert">Revert</a>
+        <a href="/kpi">KPI</a>
+        <a href="/admin">Admin</a>
+        <a href="/logout">Logout</a>
+      </nav>`
+    : '';
   return `<!DOCTYPE html>
   <html lang="en">
   <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>${title}</title>
-    <style>
-      :root { color-scheme: dark; }
-      body { font-family: Inter, system-ui, Arial, sans-serif; background-color: #0f1115; color: #eaeaf0; padding: 24px; }
-      .container { max-width: 900px; margin: 0 auto; }
-      h1 { margin: 0 0 16px; font-size: 24px; }
-      h2 { margin: 24px 0 12px; font-size: 18px; }
-      .nav { display:flex; gap:12px; margin-bottom: 16px; }
-      .nav a { color:#9ec1ff; text-decoration:none; background:#151926; padding:8px 10px; border-radius:8px; }
-      form { display: grid; gap: 10px; margin-bottom: 20px; }
-      label { font-size: 14px; opacity: 0.9; }
-      input[type="file"], input[type="number"], input[type="text"], input[type="password"], select, button, textarea {
-        padding: 10px; border-radius: 8px; border: 1px solid #2a2f45; background-color: #121624; color: #eaeaf0;
-      }
-      textarea { min-height: 220px; white-space: pre; }
-      button { background: linear-gradient(180deg, #6a0dad, #52118e); border: none; cursor: pointer; font-weight: 600; }
-      button:hover { filter: brightness(1.06); }
-      .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-      .notice { padding: 12px; background-color: #11172b; border: 1px solid #2a2f45; border-radius: 8px; }
-      table { width: 100%; border-collapse: collapse; }
-      th, td { border-bottom: 1px solid #2a2f45; padding: 8px; text-align: left; font-size: 13px; }
-      .danger { background: linear-gradient(180deg, #d64b4b, #a52929); }
-      .muted { opacity: 0.8; font-size: 12px; }
-      .help { font-size:12px; opacity:0.8; }
-      .card { padding:16px; background:#0f1424; border:1px solid #222a44; border-radius:12px; }
-      .actions { display:flex; gap: 10px; flex-wrap: wrap; }
-    </style>
+    ${pageHead(title)}
   </head>
   <body>
     <div class="container">
+      <header>
+        <img src="/static/logo.png" class="logo" alt="BlueMagic"/>
+        <div><div class="muted">BlueMagic</div><h1>${title}</h1></div>
+      </header>
       ${nav}
-      <h1>${title}</h1>
       ${content}
     </div>
+    <div class="presence" id="presenceBox" style="display:none">
+      <h4>Online now</h4>
+      <div id="presenceList">—</div>
+    </div>
+    <script>
+      // Clipboard buttons
+      function copyFrom(id){
+        const el = document.getElementById(id);
+        if(!el) return;
+        el.select(); document.execCommand('copy');
+        if (navigator.clipboard) { navigator.clipboard.writeText(el.value).catch(()=>{}); }
+        alert('Copied to clipboard');
+      }
+      // Presence pings
+      fetch('/presence/ping',{method:'POST', headers:{'Content-Type':'application/json'}}).catch(()=>{});
+      setInterval(()=>{ fetch('/presence/ping',{method:'POST', headers:{'Content-Type':'application/json'}}).catch(()=>{}); }, 20000);
+      // Presence list
+      function refreshPresence(){
+        fetch('/presence/list').then(r=>r.json()).then(d=>{
+          const box=document.getElementById('presenceBox');
+          const list=document.getElementById('presenceList');
+          if(!d || !d.people){box.style.display='none';return;}
+          list.innerHTML = d.people.map(p=>'• '+p).join('<br>') || '—';
+          box.style.display='block';
+        }).catch(()=>{});
+      }
+      setInterval(refreshPresence, 15000);
+      refreshPresence();
+    </script>
   </body>
   </html>`;
 }
 
-async function logEvent(action, details = {}, actor = 'user') {
+async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
   try {
-    await Log.create({ action, details, actor });
+    const actor_name = req?.session?.vaName || null;
+    await Log.create({ action, details, actor_type, actor_name });
   } catch (e) {
     console.error('Log error:', e);
   }
@@ -123,16 +225,15 @@ async function logEvent(action, details = {}, actor = 'user') {
 
 // ===== AUTH MIDDLEWARES =====
 function requireUser(req, res, next) {
-  if (req.path === '/login' || req.path.startsWith('/admin') || req.path === '/health') return next();
+  const publicPaths = ['/login', '/admin/login', '/health', '/static', '/presence/ping', '/presence/list'];
+  if (publicPaths.some((p) => req.path.startsWith(p))) return next();
   if (req.session?.loggedIn) return next();
   return res.redirect('/login');
 }
-
 function requireAdmin(req, res, next) {
   if (req.session?.isAdmin) return next();
   return res.redirect('/admin/login');
 }
-
 app.use(requireUser);
 
 // ===== HEALTH =====
@@ -143,32 +244,55 @@ app.get('/login', (req, res) => {
   const html = renderPage(
     'Login',
     `
-    <form action="/login" method="post" class="card">
-      <label>Enter password to access</label>
-      <input type="password" name="password" placeholder="Password" required />
-      <button type="submit">Login</button>
-      <p class="help">You only need to login once per session.</p>
-    </form>
+    <div class="card">
+      <form action="/login" method="post">
+        <label>Enter access password (or a VA password)</label>
+        <input type="password" name="password" placeholder="Password" required />
+        <button type="submit">Login</button>
+        <p class="muted">You only need to login once per session.</p>
+      </form>
+    </div>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
 
 app.post('/login', async (req, res) => {
-  const pwd = req.body.password || '';
+  const pwd = (req.body.password || '').trim();
+
+  // 1) Site-wide user password
   if (pwd === USER_PASSWORD) {
     req.session.loggedIn = true;
-    await logEvent('user_login', {}, 'user');
+    req.session.isAdmin = false;
+    req.session.vaName = null;
+    await logEvent({ action: 'user_login', req, actor_type: 'user' });
     return res.redirect('/add');
   }
-  const html = renderPage('Login', `<div class="notice">Wrong password.</div>
-    <p><a href="/login">Try again</a></p>`, { sessionUser: req.session });
+
+  // 2) VA password (hashed)
+  const va = await VAUser.findOne({});
+  const possible = await VAUser.find({}).lean();
+  for (const v of possible) {
+    if (await bcrypt.compare(pwd, v.password_hash)) {
+      req.session.loggedIn = true;
+      req.session.isAdmin = false;
+      req.session.vaName = v.name;
+      await logEvent({ action: 'va_login', req, actor_type: 'va', details: { va: v.name } });
+      return res.redirect('/add');
+    }
+  }
+
+  const html = renderPage('Login', `<div class="notice">Wrong password.</div><p><a href="/login">Try again</a></p>`, req);
   res.status(401).send(html);
 });
 
 app.get('/logout', async (req, res) => {
-  await logEvent('user_logout', {}, req.session?.isAdmin ? 'admin' : 'user');
+  await logEvent({
+    action: 'logout',
+    req,
+    actor_type: req.session?.isAdmin ? 'admin' : (req.session?.vaName ? 'va' : 'user'),
+  });
   req.session.destroy(() => res.redirect('/login'));
 });
 
@@ -177,29 +301,47 @@ app.get('/admin/login', (req, res) => {
   const html = renderPage(
     'Admin Login',
     `
-    <form action="/admin/login" method="post" class="card">
-      <label>Admin password</label>
-      <input type="password" name="password" placeholder="Admin password" required />
-      <button type="submit">Login as Admin</button>
-      <p class="help">Admin lets you view logs, sync used usernames, export CSV, and clear the database.</p>
-    </form>
+    <div class="card">
+      <form action="/admin/login" method="post">
+        <label>Admin password</label>
+        <input type="password" name="password" placeholder="Admin password" required />
+        <button type="submit">Login as Admin</button>
+        <p class="muted">Admin lets you manage models, users, logs, CSV export, and database operations.</p>
+      </form>
+    </div>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
 
 app.post('/admin/login', async (req, res) => {
-  const pwd = req.body.password || '';
+  const pwd = (req.body.password || '').trim();
   if (pwd === ADMIN_PASSWORD) {
-    req.session.loggedIn = true; // ensure base auth as well
+    req.session.loggedIn = true;
     req.session.isAdmin = true;
-    await logEvent('admin_login', {}, 'admin');
+    req.session.vaName = null;
+    await logEvent({ action: 'admin_login', req, actor_type: 'admin' });
     return res.redirect('/admin');
   }
-  const html = renderPage('Admin Login', `<div class="notice">Wrong admin password.</div>
-    <p><a href="/admin/login">Try again</a></p>`, { sessionUser: req.session });
+  const html = renderPage('Admin Login', `<div class="notice">Wrong admin password.</div><p><a href="/admin/login">Try again</a></p>`, req);
   res.status(401).send(html);
+});
+
+// ===== PRESENCE =====
+app.post('/presence/ping', (req, res) => {
+  const name = (req.session?.vaName || (req.session?.isAdmin ? 'Admin' : 'User'));
+  if (req.sessionID) presence.set(req.sessionID, { name, when: Date.now() });
+  res.json({ ok: true });
+});
+app.get('/presence/list', (req, res) => {
+  const now = Date.now();
+  const list = [];
+  for (const [sid, info] of presence.entries()) {
+    if (now - info.when <= PRESENCE_TTL_MS) list.push(info.name);
+    else presence.delete(sid);
+  }
+  res.json({ people: [...new Set(list)] });
 });
 
 // ===== ROUTES =====
@@ -207,21 +349,109 @@ app.post('/admin/login', async (req, res) => {
 // Home → redirect
 app.get('/', (req, res) => res.redirect('/add'));
 
-// Import usernames (USER)
-app.get('/add', (req, res) => {
+// ---------- MODELS ----------
+app.get('/admin/models', requireAdmin, async (req, res) => {
+  const models = await Model.find({}).sort({ name: 1 }).lean();
+  const rows = models.map(m => `<tr><td>${m.name}</td><td class="actions">
+      <form action="/admin/models/delete" method="post" style="display:inline"><input type="hidden" name="name" value="${m.name}"/><button class="danger">Delete</button></form>
+    </td></tr>`).join('');
+  const html = renderPage(
+    'Models',
+    `
+    <div class="card">
+      <form action="/admin/models/add" method="post" class="actions">
+        <input type="text" name="name" placeholder="New model name" required />
+        <button type="submit">Add model</button>
+        <a href="/admin">Back to Admin</a>
+      </form>
+    </div>
+    <div class="card">
+      <table><thead><tr><th>Model</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="2">No models yet.</td></tr>'}</tbody></table>
+    </div>
+    `,
+    req
+  );
+  res.send(html);
+});
+app.post('/admin/models/add', requireAdmin, async (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (!name) return res.redirect('/admin/models');
+  await Model.updateOne({ name }, { $setOnInsert: { name } }, { upsert: true });
+  await logEvent({ action: 'admin_model_add', req, actor_type: 'admin', details: { name } });
+  res.redirect('/admin/models');
+});
+app.post('/admin/models/delete', requireAdmin, async (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (!name) return res.redirect('/admin/models');
+  await Model.deleteOne({ name });
+  await logEvent({ action: 'admin_model_delete', req, actor_type: 'admin', details: { name } });
+  res.redirect('/admin/models');
+});
+
+// ---------- VA USERS ----------
+app.get('/admin/users', requireAdmin, async (req, res) => {
+  const users = await VAUser.find({}).sort({ name: 1 }).lean();
+  const rows = users.map(u => `<tr><td>${u.name}</td><td class="actions">
+    <form action="/admin/users/delete" method="post" style="display:inline"><input type="hidden" name="name" value="${u.name}"/><button class="danger">Delete</button></form>
+  </td></tr>`).join('');
+  const html = renderPage(
+    'VA Users',
+    `
+    <div class="card">
+      <form action="/admin/users/add" method="post" class="row">
+        <div><input type="text" name="name" placeholder="VA name" required /></div>
+        <div><input type="password" name="password" placeholder="New VA password" required /></div>
+        <div><button type="submit">Add / Update VA</button></div>
+      </form>
+      <p class="muted">Passwords are stored hashed with bcrypt.</p>
+      <p><a href="/admin">Back to Admin</a></p>
+    </div>
+    <div class="card">
+      <table><thead><tr><th>VA</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="2">No VAs yet.</td></tr>'}</tbody></table>
+    </div>
+    `,
+    req
+  );
+  res.send(html);
+});
+app.post('/admin/users/add', requireAdmin, async (req, res) => {
+  const name = (req.body.name || '').trim();
+  const pwd = (req.body.password || '').trim();
+  if (!name || !pwd) return res.redirect('/admin/users');
+  const hash = await bcrypt.hash(pwd, 10);
+  await VAUser.updateOne({ name }, { $set: { password_hash: hash } }, { upsert: true });
+  await logEvent({ action: 'admin_va_add_or_update', req, actor_type: 'admin', details: { name } });
+  res.redirect('/admin/users');
+});
+app.post('/admin/users/delete', requireAdmin, async (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (!name) return res.redirect('/admin/users');
+  await VAUser.deleteOne({ name });
+  await logEvent({ action: 'admin_va_delete', req, actor_type: 'admin', details: { name } });
+  res.redirect('/admin/users');
+});
+
+// ---------- IMPORT ----------
+app.get('/add', async (req, res) => {
   const html = renderPage(
     'Import Usernames',
     `
-    <form action="/add" method="post" enctype="multipart/form-data" class="card">
-      <label>Upload a .txt file with one Instagram username per line:</label>
-      <input type="file" name="file" accept=".txt" required />
-      <button type="submit">Import Usernames</button>
-    </form>
-    <div class="help">Duplicates are ignored automatically. Results will show counts.</div>
-    <p><a href="/format">Go to Format & Take Usernames</a></p>
-    <p><a href="/admin">Admin panel</a></p>
+    <div class="card">
+      <form action="/add" method="post" enctype="multipart/form-data">
+        <label>Upload a .txt file with one Instagram username per line:</label>
+        <input type="file" name="file" accept=".txt" required />
+        <button type="submit">Import Usernames</button>
+      </form>
+      <div class="muted">Duplicates are ignored automatically. Results will show counts.</div>
+      <div class="actions">
+        <a href="/format">Go to Format & Take</a>
+        <a href="/revert">Revert</a>
+        <a href="/kpi">KPI</a>
+        <a href="/admin">Admin panel</a>
+      </div>
+    </div>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
@@ -232,22 +462,32 @@ app.post('/add', upload.single('file'), async (req, res) => {
   const content = req.file.buffer.toString('utf-8');
   const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
 
+  // bulkWrite for speed
+  const ops = lines.map((raw) => {
+    const username = raw.toLowerCase().replace(/^@/, '');
+    return {
+      updateOne: {
+        filter: { username },
+        update: { $setOnInsert: { username, date_added: new Date(), used_by: [] } },
+        upsert: true,
+      },
+    };
+  });
   let inserted = 0;
-  for (const raw of lines) {
-    const username = raw.toLowerCase();
-    try {
-      const result = await Username.updateOne(
-        { username },
-        { $setOnInsert: { date_added: new Date(), used_by: [] } },
-        { upsert: true }
-      );
-      if (result.upsertedCount > 0) inserted++;
-    } catch (err) {
-      console.error(`Error inserting ${username}:`, err);
-    }
+  try {
+    const result = await Username.bulkWrite(ops, { ordered: false });
+    inserted = (result.upsertedCount) || 0;
+  } catch (e) {
+    // ignore per-row duplicate errors
   }
+
   const duplicates = lines.length - inserted;
-  await logEvent('import_usernames', { processed: lines.length, inserted, duplicates });
+  await logEvent({
+    action: 'import_usernames',
+    details: { processed: lines.length, inserted, duplicates },
+    req,
+    actor_type: req.session?.vaName ? 'va' : 'user',
+  });
 
   const html = renderPage(
     'Import Usernames Result',
@@ -260,64 +500,78 @@ app.post('/add', upload.single('file'), async (req, res) => {
     <p><a href="/add">Back to Import</a></p>
     <p><a href="/format">Go to Format & Take Usernames</a></p>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
 
-// Legacy /take
-app.get('/take', (_req, res) => res.redirect('/format'));
-app.post('/take', (req, res) => res.redirect(307, '/format'));
-
-// Helper: Fetch next usernames for a model
-async function fetchUsernames(model, count) {
-  const docs = await Username.find({ used_by: { $ne: model } })
-    .sort({ date_added: -1 })
-    .limit(count)
-    .exec();
-  const ids = docs.map((d) => d._id);
-  if (ids.length) {
-    await Username.updateMany({ _id: { $in: ids } }, { $addToSet: { used_by: model } });
-  }
-  return docs.map((d) => d.username);
+// ---------- FORMAT & TAKE ----------
+async function fetchInventoryCounts(model) {
+  const total = await Username.countDocuments({});
+  const unusedForModel = await Username.countDocuments({ used_by: { $ne: model } });
+  return { total, unusedForModel };
 }
 
-// Format & Take (USER)
-app.get('/format', (req, res) => {
+// atomic(ish) allocation (simple version; good enough for single server)
+async function takeUsernames(model, takeCount) {
+  const docs = await Username.find({ used_by: { $ne: model } })
+    .sort({ date_added: -1 })
+    .limit(takeCount)
+    .lean();
+
+  const ids = docs.map(d => d._id);
+  if (ids.length) {
+    await Username.updateMany(
+      { _id: { $in: ids } },
+      { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } }
+    );
+  }
+  return { usernames: docs.map(d => d.username), ids };
+}
+
+app.get('/format', async (req, res) => {
+  const models = await Model.find({}).sort({ name: 1 }).lean();
+  const options = models.length
+    ? models.map(m => `<option value="${m.name}">${m.name}</option>`).join('')
+    : `<option value="Natalie">Natalie</option>`;
+
   const html = renderPage(
     'Format & Take Usernames',
     `
-    <form action="/format" method="post" class="card">
-      <div class="row">
-        <div>
-          <label>Select model:</label>
-          <select name="model" required>
-            <option value="Natalie">Natalie</option>
-          </select>
+    <div class="card">
+      <form action="/format" method="post">
+        <div class="row">
+          <div>
+            <label>Select model:</label>
+            <select name="model" required>${options}</select>
+          </div>
+          <div>
+            <label>Accounts to pull (A):</label>
+            <input type="number" name="count" min="1" value="10" required />
+            <div class="muted">These are the accounts that will follow.</div>
+          </div>
         </div>
-        <div>
-          <label>Accounts to pull (A):</label>
-          <input type="number" name="count" min="1" value="10" required />
-          <div class="help">These are the accounts that will follow.</div>
+        <div class="row">
+          <div>
+            <label>Usernames per line (B):</label>
+            <input type="number" name="perLine" min="1" value="10" required />
+            <div class="muted">These are scraped usernames per account.</div>
+          </div>
+          <div>
+            <label>Total = A × B</label>
+            <input type="text" value="Calculated after submit" disabled />
+          </div>
         </div>
+        <button type="submit">Format and Preview</button>
+      </form>
+      <div class="muted">Live inventory counters will display after you select a model and submit.</div>
+      <div class="actions" style="margin-top:8px;">
+        <a href="/revert">Revert</a>
+        <a href="/kpi">KPI</a>
       </div>
-      <div class="row">
-        <div>
-          <label>Usernames per line (B):</label>
-          <input type="number" name="perLine" min="1" value="10" required />
-          <div class="help">These are scraped usernames per account.</div>
-        </div>
-        <div>
-          <label>Total usernames fetched = A × B (auto)</label>
-          <input type="text" value="Calculated after submit" disabled />
-        </div>
-      </div>
-      <button type="submit">Format and Preview</button>
-    </form>
-    <p><a href="/add">Import more usernames</a></p>
-    <p><a href="/admin">Admin panel</a></p>
+    </div>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
@@ -326,60 +580,75 @@ app.post('/format', async (req, res) => {
   const count = parseInt(req.body.count, 10);
   const perLine = parseInt(req.body.perLine, 10);
   const model = (req.body.model || 'Natalie').trim();
-
   if (!count || !perLine || count < 1 || perLine < 1) {
     return res.status(400).send('Invalid form values');
   }
 
-  try {
-    // NEW: fetch A × B usernames total
-    const totalToFetch = count * perLine;
-    const usernames = await fetchUsernames(model, totalToFetch);
+  const totalToFetch = count * perLine;
+  const { usernames, ids } = await takeUsernames(model, totalToFetch);
 
-    // Group into B per line
-    const lines = [];
-    for (let i = 0; i < usernames.length; i += perLine) {
-      lines.push(usernames.slice(i, i + perLine).join(','));
-    }
-    const formatted = lines.join('\n');
+  // Group into B per line
+  const lines = [];
+  for (let i = 0; i < usernames.length; i += perLine) {
+    lines.push(usernames.slice(i, i + perLine).join(','));
+  }
+  const formatted = lines.join('\n');
 
-    await logEvent('format_take', {
+  // Store activity (for revert/KPI)
+  const act = await Activity.create({
+    model,
+    va: req.session?.vaName || null,
+    accounts: count,
+    per_line: perLine,
+    total_usernames: usernames.length,
+    username_ids: ids,
+  });
+
+  await logEvent({
+    action: 'format_take',
+    details: {
       model,
       requested_accounts: count,
       per_line: perLine,
       total_requested: totalToFetch,
       total_returned: usernames.length,
-    });
+      activity_id: String(act._id),
+    },
+    req,
+    actor_type: req.session?.vaName ? 'va' : 'user',
+  });
 
-    const html = renderPage(
-      'Formatted Usernames',
-      `
-      <div class="notice">
-        <p>Model: <b>${model}</b></p>
-        <p>Accounts (A): ${count} &nbsp; | &nbsp; Per line (B): ${perLine} &nbsp; ⇒ &nbsp; Requested total: ${totalToFetch}</p>
-        <p>Returned: ${usernames.length}</p>
-      </div>
+  const inv = await fetchInventoryCounts(model);
 
-      <label>Preview (Ctrl+A then Ctrl+C to copy all):</label>
-      <textarea readonly>${formatted}</textarea>
+  const html = renderPage(
+    'Formatted Usernames',
+    `
+    <div class="notice">
+      <p>Model: <b>${model}</b></p>
+      <p>A = ${count} &nbsp; | &nbsp; B = ${perLine} &nbsp; ⇒ &nbsp; Requested: ${totalToFetch}</p>
+      <p>Returned: ${usernames.length}</p>
+      <div class="kpi-pill">Total in DB: ${inv.total}</div>
+      <div class="kpi-pill">Unused for ${model}: ${inv.unusedForModel}</div>
+    </div>
 
-      <form action="/download" method="post" class="actions">
+    <label>Preview:</label>
+    <textarea id="formattedBox" readonly>${formatted}</textarea>
+    <div class="actions">
+      <button type="button" onclick="copyFrom('formattedBox')">Copy to clipboard</button>
+      <form action="/download" method="post">
         <input type="hidden" name="data" value="${encodeURIComponent(formatted)}" />
         <input type="hidden" name="filename" value="usernames_${model}.txt" />
         <button type="submit">Download .txt</button>
       </form>
+    </div>
 
-      <p><a href="/format">Back to Format & Take</a></p>
-      <p><a href="/add">Import more usernames</a></p>
-      <p><a href="/admin">Admin panel</a></p>
-      `,
-      { sessionUser: req.session }
-    );
-    res.send(html);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send('Server error');
-  }
+    <div class="muted" style="margin-top:10px;">Activity saved. You can revert it from the <a href="/revert">Revert</a> page.</div>
+
+    <p style="margin-top:14px;"><a href="/format">Back to Format & Take</a></p>
+    `,
+    req
+  );
+  res.send(html);
 });
 
 // Download formatted data
@@ -391,84 +660,209 @@ app.post('/download', (req, res) => {
   res.send(data);
 });
 
-// ===== ADMIN PANEL =====
+// ---------- REVERT ----------
+app.get('/revert', async (req, res) => {
+  const who = req.session?.vaName;
+  const query = who ? { va: who, undone: false } : { undone: false };
+  const acts = await Activity.find(query).sort({ ts: -1 }).limit(10).lean();
+  const rows = acts.map(a => `
+    <tr>
+      <td>${new Date(a.ts).toLocaleString()}</td>
+      <td>${a.va || '—'}</td>
+      <td>${a.model}</td>
+      <td>A=${a.accounts}, B=${a.per_line}, Total=${a.total_usernames}</td>
+      <td>
+        <form action="/revert" method="post" onsubmit="return confirm('Revert this activity?');">
+          <input type="hidden" name="id" value="${a._id}" />
+          <button class="danger">Revert</button>
+        </form>
+      </td>
+    </tr>
+  `).join('');
+  const html = renderPage(
+    'Revert Last Actions',
+    `
+    <div class="card">
+      <div class="muted">Showing ${acts.length} recent activities ${who ? `(for VA: ${who})` : '(all users)'}</div>
+      <table>
+        <thead><tr><th>Date</th><th>VA</th><th>Model</th><th>Counts</th><th>Action</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5">No recent activities.</td></tr>'}</tbody>
+      </table>
+    </div>
+    `,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/revert', async (req, res) => {
+  const id = (req.body.id || '').trim();
+  const act = await Activity.findById(id);
+  if (!act || act.undone) return res.redirect('/revert');
+
+  // Remove model from used_by for these IDs
+  await Username.updateMany(
+    { _id: { $in: act.username_ids } },
+    { $pull: { used_by: act.model } }
+  );
+  act.undone = true;
+  await act.save();
+
+  await logEvent({
+    action: 'revert_activity',
+    details: { activity_id: id, model: act.model, total_usernames: act.total_usernames },
+    req,
+    actor_type: req.session?.vaName ? 'va' : 'user',
+  });
+
+  res.redirect('/revert');
+});
+
+// ---------- KPI ----------
+app.get('/kpi', async (req, res) => {
+  const models = await Model.find({}).sort({ name: 1 }).lean();
+  const options = models.length
+    ? `<option value="">All models</option>` + models.map(m => `<option>${m.name}</option>`).join('')
+    : `<option value="">All models</option><option>Natalie</option>`;
+
+  const html = renderPage(
+    'KPI Builder',
+    `
+    <div class="card">
+      <form action="/kpi" method="post" class="row">
+        <div><label>From (YYYY-MM-DD)</label><input type="text" name="from" placeholder="2025-08-01" required/></div>
+        <div><label>To (YYYY-MM-DD)</label><input type="text" name="to" placeholder="2025-08-31" required/></div>
+        <div><label>Model</label><select name="model">${options}</select></div>
+        <div style="display:flex; align-items:end;"><button type="submit">Load</button></div>
+      </form>
+      <div class="muted">Pick a range, optionally filter by model, then select activities to add to totals.</div>
+    </div>
+    `,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/kpi', async (req, res) => {
+  const { from, to, model = '' } = req.body;
+  const q = { ts: { $gte: new Date(from), $lte: new Date(to + 'T23:59:59.999Z') }, undone: false };
+  if (model) q.model = model;
+  const acts = await Activity.find(q).sort({ ts: -1 }).lean();
+
+  const rows = acts.map(a => `
+    <tr>
+      <td><input type="checkbox" name="pick" value="${a._id}" data-a="${a.accounts}" data-b="${a.per_line}" data-total="${a.total_usernames}"/></td>
+      <td>${new Date(a.ts).toLocaleString()}</td>
+      <td>${a.va || '—'}</td>
+      <td>${a.model}</td>
+      <td>A=${a.accounts}</td>
+      <td>B=${a.per_line}</td>
+      <td>Total=${a.total_usernames}</td>
+    </tr>
+  `).join('');
+
+  const html = renderPage(
+    'KPI Builder',
+    `
+    <div class="card">
+      <div class="actions" style="margin-bottom:8px;">
+        <button type="button" onclick="selectAll(true)">Select all</button>
+        <button type="button" onclick="selectAll(false)">Clear</button>
+      </div>
+      <table>
+        <thead><tr><th></th><th>Date</th><th>VA</th><th>Model</th><th>A</th><th>B</th><th>Total</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7">No activities in range.</td></tr>'}</tbody>
+      </table>
+      <div class="notice" style="margin-top:10px;">
+        <div id="kpiOut">A=0, B=0 (sum of picked rows doesn’t make sense); Total=0</div>
+      </div>
+      <script>
+        function recalc(){
+          let A=0, B=0, T=0;
+          document.querySelectorAll('input[name=pick]:checked').forEach(cb=>{
+            A += parseInt(cb.dataset.a,10);
+            B += parseInt(cb.dataset.b,10);
+            T += parseInt(cb.dataset.total,10);
+          });
+          document.getElementById('kpiOut').innerText = 'A='+A+', B='+B+'; Total='+T;
+        }
+        function selectAll(v){
+          document.querySelectorAll('input[name=pick]').forEach(cb => { cb.checked=v; });
+          recalc();
+        }
+        document.querySelectorAll('input[name=pick]').forEach(cb=>cb.addEventListener('change', recalc));
+      </script>
+    </div>
+    <p><a href="/kpi">Back</a></p>
+    `,
+    req
+  );
+  res.send(html);
+});
+
+// ---------- ADMIN PANEL (logs, export, clear, models/users, metrics, sync used) ----------
 app.get('/admin', requireAdmin, async (req, res) => {
+  const total = await Username.countDocuments({});
+  const models = await Model.find({}).sort({ name: 1 }).lean();
+
+  // per-model counts
+  let modelRows = '';
+  for (const m of models) {
+    const used = await Username.countDocuments({ used_by: m.name });
+    const unused = await Username.countDocuments({ used_by: { $ne: m.name } });
+    modelRows += `<tr><td>${m.name}</td><td>${used}</td><td>${unused}</td></tr>`;
+  }
+
   const html = renderPage(
     'Admin Panel',
     `
     <div class="card">
+      <h2>Metrics</h2>
+      <div class="kpi-pill">Total usernames: ${total}</div>
+      <table style="margin-top:10px;"><thead><tr><th>Model</th><th>Used</th><th>Unused</th></tr></thead><tbody>${modelRows || '<tr><td colspan="3">No models yet.</td></tr>'}</tbody></table>
+    </div>
+
+    <div class="card">
       <h2>Logs</h2>
       <form action="/admin/logs" method="get" class="actions">
         <button type="submit">View latest logs</button>
+        <a href="/admin/export">Export CSV</a>
+        <a href="/admin/models">Manage Models</a>
+        <a href="/admin/users">Manage VA Users</a>
       </form>
     </div>
 
     <div class="card">
-      <h2>Sync used usernames</h2>
-      <form action="/admin/upload-used" method="post" enctype="multipart/form-data">
-        <label>Upload a .txt file of usernames already used by <b>Natalie</b>:</label>
-        <input type="file" name="file" accept=".txt" required />
-        <button type="submit">Sync</button>
+      <h2>Sync used usernames (by model)</h2>
+      <form action="/admin/upload-used" method="post" enctype="multipart/form-data" class="row">
+        <div><label>Model</label><input type="text" name="model" placeholder="e.g. Natalie" required/></div>
+        <div><label>File (.txt)</label><input type="file" name="file" accept=".txt" required/></div>
+        <div style="display:flex; align-items:end;"><button type="submit">Sync</button></div>
       </form>
-    </div>
-
-    <div class="card">
-      <h2>Export CSV</h2>
-      <form action="/admin/export" method="post" class="row">
-        <div>
-          <label>Filter by model (optional):</label>
-          <input type="text" name="model" placeholder="e.g. Natalie" />
-        </div>
-        <div>
-          <label>Used status:</label>
-          <select name="status">
-            <option value="any">Any</option>
-            <option value="unused">Unused by model</option>
-            <option value="used_by_model">Used by model</option>
-            <option value="used_by_any">Used by any model</option>
-          </select>
-        </div>
-        <div>
-          <label>From date (optional):</label>
-          <input type="text" name="from" placeholder="YYYY-MM-DD" />
-        </div>
-        <div>
-          <label>To date (optional):</label>
-          <input type="text" name="to" placeholder="YYYY-MM-DD" />
-        </div>
-        <div>
-          <label>Limit:</label>
-          <input type="number" name="limit" min="1" value="1000" />
-        </div>
-        <div style="display:flex; align-items:end;">
-          <button type="submit">Export CSV</button>
-        </div>
-      </form>
-      <p class="help">CSV columns: username, date_added (ISO), used_by (pipe-separated)</p>
     </div>
 
     <div class="card">
       <h2>Danger zone</h2>
       <form action="/admin/clear" method="post">
-        <label class="help">Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></label>
+        <label class="muted">Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></label>
         <input type="text" name="confirm" placeholder="${CLEAR_CONFIRM_TEXT}" required />
         <button type="submit" class="danger">Clear Database</button>
       </form>
-      <p class="help">Requires you to be logged in as admin (already are). This deletes <b>all</b> usernames.</p>
+      <p class="muted">Deletes <b>all</b> usernames. Logs remain.</p>
     </div>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
 
 // Admin logs
 app.get('/admin/logs', requireAdmin, async (req, res) => {
-  const logs = await Log.find({}).sort({ ts: -1 }).limit(200).lean();
+  const logs = await Log.find({}).sort({ ts: -1 }).limit(300).lean();
   const rows = logs
     .map(
       (l) =>
-        `<tr><td>${new Date(l.ts).toLocaleString()}</td><td>${l.actor}</td><td>${l.action}</td><td><code>${JSON.stringify(
+        `<tr><td>${new Date(l.ts).toLocaleString()}</td><td>${l.actor_type}${l.actor_name ? ' ('+l.actor_name+')' : ''}</td><td>${l.action}</td><td><code>${JSON.stringify(
           l.details || {}
         )}</code></td></tr>`
     )
@@ -483,62 +877,48 @@ app.get('/admin/logs', requireAdmin, async (req, res) => {
     </table>
     <p><a href="/admin">Back to Admin</a></p>
     `,
-    { sessionUser: req.session }
+    req
   );
   res.send(html);
 });
 
-// Move Sync used usernames to Admin
-app.post('/admin/upload-used', requireAdmin, upload.single('file'), async (req, res) => {
-  if (!req.file) return res.status(400).send('No file uploaded');
-  const content = req.file.buffer.toString('utf-8');
-  const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-
-  let updated = 0;
-  let inserted = 0;
-  for (const raw of lines) {
-    const username = raw.toLowerCase();
-    try {
-      const existing = await Username.findOne({ username });
-      if (existing) {
-        await Username.updateOne({ _id: existing._id }, { $addToSet: { used_by: 'Natalie' } });
-        updated++;
-      } else {
-        await Username.create({ username, used_by: ['Natalie'] });
-        inserted++;
-      }
-    } catch (err) {
-      console.error(err);
-    }
-  }
-  await logEvent('admin_sync_used', { processed: lines.length, updated, inserted }, 'admin');
-
-  const html = renderPage(
-    'Sync Used Usernames Result',
-    `
-    <div class="notice">
-      <p>Processed ${lines.length} usernames.</p>
-      <p>Updated ${updated} existing entries.</p>
-      <p>Inserted ${inserted} new entries.</p>
-    </div>
-    <p><a href="/admin">Back to Admin</a></p>
-    `,
-    { sessionUser: req.session }
+// Admin CSV export (simple form GET for convenience)
+app.get('/admin/export', requireAdmin, (_req, res) => {
+  res.send(
+    renderPage(
+      'Export CSV',
+      `
+      <div class="card">
+        <form action="/admin/export" method="post" class="row">
+          <div><label>Filter by model (optional):</label><input type="text" name="model" placeholder="e.g. Natalie" /></div>
+          <div><label>Used status:</label>
+            <select name="status">
+              <option value="any">Any</option>
+              <option value="unused">Unused by model</option>
+              <option value="used_by_model">Used by model</option>
+              <option value="used_by_any">Used by any model</option>
+            </select>
+          </div>
+          <div><label>From date (optional):</label><input type="text" name="from" placeholder="YYYY-MM-DD" /></div>
+          <div><label>To date (optional):</label><input type="text" name="to" placeholder="YYYY-MM-DD" /></div>
+          <div><label>Limit:</label><input type="number" name="limit" min="1" value="1000" /></div>
+          <div style="display:flex; align-items:end;"><button type="submit">Export CSV</button></div>
+        </form>
+      </div>
+      <p><a href="/admin">Back</a></p>
+      `,
+      _req
+    )
   );
-  res.send(html);
 });
 
-// Admin CSV export
 app.post('/admin/export', requireAdmin, async (req, res) => {
   const { model = '', status = 'any', from = '', to = '', limit = '1000' } = req.body;
-
   const q = {};
-  // date filter
   if (from || to) q.date_added = {};
   if (from) q.date_added.$gte = new Date(from);
   if (to) q.date_added.$lte = new Date(to + 'T23:59:59.999Z');
 
-  // used status logic
   if (status === 'unused' && model) q.used_by = { $ne: model };
   if (status === 'used_by_model' && model) q.used_by = model;
   if (status === 'used_by_any') q.used_by = { $exists: true, $ne: [] };
@@ -546,12 +926,12 @@ app.post('/admin/export', requireAdmin, async (req, res) => {
   const lim = Math.max(1, Math.min(parseInt(limit, 10) || 1000, 100000));
   const docs = await Username.find(q).sort({ date_added: -1 }).limit(lim).lean();
 
-  await logEvent('admin_export_csv', { count: docs.length, query: q }, 'admin');
+  await logEvent({ action: 'admin_export_csv', req, actor_type: 'admin', details: { count: docs.length, query: q } });
 
-  let csv = 'username,date_added,used_by\n';
+  let csv = 'username,date_added,used_by,last_used_at,last_used_by\n';
   for (const d of docs) {
     const used = (d.used_by || []).join('|');
-    csv += `${d.username},${new Date(d.date_added).toISOString()},${used}\n`;
+    csv += `${d.username},${new Date(d.date_added).toISOString()},${used},${d.last_used_at ? new Date(d.last_used_at).toISOString() : ''},${d.last_used_by || ''}\n`;
   }
 
   res.setHeader('Content-Disposition', `attachment; filename="export_${Date.now()}.csv"`);
@@ -559,31 +939,72 @@ app.post('/admin/export', requireAdmin, async (req, res) => {
   res.send(csv);
 });
 
-// Admin clear DB (with confirmation text)
-app.post('/admin/clear', requireAdmin, async (req, res) => {
-  const confirm = req.body.confirm || '';
-  if (confirm !== CLEAR_CONFIRM_TEXT) {
-    const html = renderPage(
-      'Clear Database',
-      `<div class="notice">Confirmation text mismatch. Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></div>
-       <p><a href="/admin">Back to Admin</a></p>`,
-      { sessionUser: req.session }
-    );
-    return res.status(400).send(html);
+// Move Sync used usernames to Admin (with model choice)
+app.post('/admin/upload-used', requireAdmin, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).send('No file uploaded');
+  const model = (req.body.model || 'Natalie').trim();
+  const content = req.file.buffer.toString('utf-8');
+  const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  let updated = 0;
+  let inserted = 0;
+  for (const raw of lines) {
+    const username = raw.toLowerCase().replace(/^@/, '');
+    try {
+      const existing = await Username.findOne({ username });
+      if (existing) {
+        await Username.updateOne({ _id: existing._id }, { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } });
+        updated++;
+      } else {
+        await Username.create({ username, used_by: [model], last_used_at: new Date(), last_used_by: model });
+        inserted++;
+      }
+    } catch (err) {
+      console.error(err);
+    }
   }
-  const del = await Username.deleteMany({});
-  await logEvent('admin_clear_db', { deleted: del.deletedCount }, 'admin');
+  await logEvent({ action: 'admin_sync_used', req, actor_type: 'admin', details: { model, processed: lines.length, updated, inserted } });
 
   const html = renderPage(
-    'Database Cleared',
-    `<div class="notice">Deleted ${del.deletedCount} usernames.</div>
-     <p><a href="/admin">Back to Admin</a></p>`,
-    { sessionUser: req.session }
+    'Sync Used Usernames Result',
+    `
+    <div class="notice">
+      <p>Model: ${model}</p>
+      <p>Processed ${lines.length} usernames.</p>
+      <p>Updated ${updated} existing entries.</p>
+      <p>Inserted ${inserted} new entries.</p>
+    </div>
+    <p><a href="/admin">Back to Admin</a></p>
+    `,
+    req
   );
   res.send(html);
 });
 
+// Admin clear DB (with confirmation text)
+app.post('/admin/clear', requireAdmin, async (req, res) => {
+  const confirm = (req.body.confirm || '').trim();
+  if (confirm !== CLEAR_CONFIRM_TEXT) {
+    return res.status(400).send(
+      renderPage(
+        'Clear Database',
+        `<div class="notice">Confirmation text mismatch. Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></div><p><a href="/admin">Back to Admin</a></p>`,
+        req
+      )
+    );
+  }
+  const del = await Username.deleteMany({});
+  await logEvent({ action: 'admin_clear_db', req, actor_type: 'admin', details: { deleted: del.deletedCount } });
+  res.send(
+    renderPage(
+      'Database Cleared',
+      `<div class="notice">Deleted ${del.deletedCount} usernames.</div><p><a href="/admin">Back to Admin</a></p>`,
+      req
+    )
+  );
+});
+
 // ===== START =====
 app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
+  console.log(`BlueMagic server on :${PORT}`);
 });
