@@ -13,7 +13,6 @@ const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const path = require('path');
 
-const IS_PROD = NODE_ENV === 'production';
 
 require('dotenv').config();
 
@@ -25,6 +24,9 @@ const {
   ADMIN_PASSWORD,
   NODE_ENV = 'development',
 } = process.env;
+
+const IS_PROD = NODE_ENV === 'production';
+
 
 // ===== CONSTANTS =====
 const CLEAR_CONFIRM_TEXT = 'I confirm to clear Database';
