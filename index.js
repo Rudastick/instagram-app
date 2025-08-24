@@ -1,7 +1,7 @@
 // app.js  — BlueMagic Instagram Username Manager (full version)
 // Implements login (user/VA/admin), admin panel, logs, revert, KPI, CSV export,
 // presence list, models CRUD, VA CRUD (with Admin checkbox), inventory counters,
-// Sync Used (with model select), and UI copy-to-clipboard.
+// Sync Used (with model select), and UI copy-to-clipboard. :)
 
 // ===== Imports =====
 const express = require('express');
@@ -15,6 +15,12 @@ const path = require('path');
 
 
 require('dotenv').config();
+
+require('dotenv').config();
+console.log('cwd:', process.cwd());
+console.log('env file seen:', require('fs').existsSync('.env'));
+console.log('SESSION_SECRET length:', (process.env.SESSION_SECRET || '').trim().length);
+
 
 const {
   MONGO_URL,
