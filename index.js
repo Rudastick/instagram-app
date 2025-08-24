@@ -13,17 +13,18 @@ const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const path = require('path');
 
-// ===== ENV =====
+const IS_PROD = NODE_ENV === 'production';
+
+require('dotenv').config();
+
 const {
   MONGO_URL,
   PORT = 3000,
-  SESSION_SECRET = 'change-me-please',
-  USER_PASSWORD = 'Blue@magicTeam!7',     // site-wide access
-  ADMIN_PASSWORD = 'Nigwedeek217',        // master admin password
+  SESSION_SECRET,
+  USER_PASSWORD,
+  ADMIN_PASSWORD,
   NODE_ENV = 'development',
 } = process.env;
-
-const IS_PROD = NODE_ENV === 'production';
 
 // ===== CONSTANTS =====
 const CLEAR_CONFIRM_TEXT = 'I confirm to clear Database';
