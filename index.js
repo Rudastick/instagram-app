@@ -16,10 +16,6 @@ const path = require('path');
 
 require('dotenv').config();
 
-require('dotenv').config();
-console.log('cwd:', process.cwd());
-console.log('env file seen:', require('fs').existsSync('.env'));
-console.log('SESSION_SECRET length:', (process.env.SESSION_SECRET || '').trim().length);
 
 
 const {
