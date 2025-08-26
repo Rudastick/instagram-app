@@ -12,6 +12,10 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcrypt');
 const path = require('path');
+const fetch = require('node-fetch');
+const { Parser } = require('json2csv');
+const crypto = require('crypto');
+
 
 
 require('dotenv').config();
@@ -30,6 +34,12 @@ const {
   ADMIN_PASSWORD,
   NODE_ENV = 'development',
 } = process.env;
+
+const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
+const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi.com';
+const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || '1', 10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '200', 10);
+
 
 const IS_PROD = NODE_ENV === 'production';
 
@@ -63,6 +73,9 @@ app.use(
 
 // Static for branding
 app.use('/static', express.static(path.join(__dirname, 'static')));
+// Scrape jobs (in-memory per-process)
+const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error }
+
 
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -166,14 +179,16 @@ function pageHead(title) {
 }
 function renderPage(title, content, req) {
   const nav = req.session?.loggedIn
-    ? `<nav>
-        <a href="/add">Import</a>
-        <a href="/format">Format & Take</a>
-        <a href="/revert">Revert</a>
-        <a href="/kpi">KPI</a>
-        <a href="/admin">Admin</a>
-        <a href="/logout">Logout</a>
-      </nav>` : '';
+  ? `<nav>
+      <a href="/add">Import</a>
+      <a href="/format">Format & Take</a>
+      <a href="/scrape">Scrape & Format IG</a>
+      <a href="/revert">Revert</a>
+      <a href="/kpi">KPI</a>
+      <a href="/admin">Admin</a>
+      <a href="/logout">Logout</a>
+    </nav>` : '';
+
   return `<!DOCTYPE html>
   <html lang="en">
   <head>${pageHead(title)}</head>
@@ -220,6 +235,69 @@ async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
     await Log.create({ action, details, actor_type, actor_name });
   } catch (e) { console.error('Log error:', e); }
 }
+// ---- IG Scraper helpers ----
+if (!RAPIDAPI_KEY) console.warn('WARNING: RAPIDAPI_KEY missing – /scrape will fail until set.');
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function pickProfile(payload) {
+  if (payload && typeof payload === 'object') {
+    if (payload.data && typeof payload.data === 'object') return payload.data;
+    if (payload.profile && typeof payload.profile === 'object') return payload.profile;
+  }
+  return payload;
+}
+
+async function fetchProfile(username) {
+  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+  const res = await fetch(url, {
+    headers: {
+      'x-rapidapi-host': RAPIDAPI_HOST,
+      'x-rapidapi-key': RAPIDAPI_KEY
+    }
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch (e) {
+    throw new Error(`Non-JSON: ${text.slice(0,120)}`);
+  }
+  const p = pickProfile(json);
+  if (!p || typeof p !== 'object') throw new Error('No profile object');
+  return p;
+}
+
+// Map to Airtable-aligned CSV fields (plus Username first)
+function mapToCsvRow(p, inputUsername) {
+  const media_count =
+    p.media_count ??
+    p.edge_owner_to_timeline_media?.count ??
+    p.timeline_media_count ?? null;
+
+  const followers =
+    p.followers_count ??
+    p.follower_count ??
+    p.edge_followed_by?.count ?? null;
+
+  const following =
+    p.following_count ??
+    p.edge_follow?.count ?? null;
+
+  const bioLinksArr = Array.isArray(p.bio_links) ? p.bio_links : [];
+  const linkInBio = bioLinksArr.length > 0;
+  const isPrivate = !!(p.is_private);
+
+  return {
+    'Username': inputUsername,
+    'Name': p.full_name || p.fullName || p.name || '',
+    'Media Count': media_count == null ? null : Number(media_count),
+    'Followers Ordered': followers == null ? null : Number(followers),
+    'Followers': followers == null ? null : Number(followers),
+    'Following': following == null ? null : Number(following),
+    'Link in bio?': linkInBio ? 'TRUE' : 'FALSE',
+    'Private?': isPrivate ? 'TRUE' : 'FALSE'
+  };
+}
+
 
 // ===== Auth middleware =====
 function requireUser(req, res, next) {
