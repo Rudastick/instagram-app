@@ -1,7 +1,5 @@
 // app.js  — BlueMagic Instagram Username Manager (full version)
-// Implements login (user/VA/admin), admin panel, logs, revert, KPI, CSV export,
-// presence list, models CRUD, VA CRUD (with Admin checkbox), inventory counters,
-// Sync Used (with model select), and UI copy-to-clipboard. :)
+// Adds "Scrape & Format IG" (UI + progress + CSV) for all logged-in users.
 
 // ===== Imports =====
 const express = require('express');
@@ -15,16 +13,13 @@ const path = require('path');
 const fetch = require('node-fetch');
 const { Parser } = require('json2csv');
 const crypto = require('crypto');
-
-
-
-require('dotenv').config();
+const fs = require('fs');
 
 require('dotenv').config();
+
 console.log('cwd:', process.cwd());
-console.log('env file seen:', require('fs').existsSync('.env'));
+console.log('env file seen:', fs.existsSync('.env'));
 console.log('SESSION_SECRET length:', (process.env.SESSION_SECRET || '').trim().length);
-
 
 const {
   MONGO_URL,
@@ -40,9 +35,7 @@ const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi
 const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || '1', 10);
 const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '200', 10);
 
-
 const IS_PROD = NODE_ENV === 'production';
-
 
 // ===== CONSTANTS =====
 const CLEAR_CONFIRM_TEXT = 'I confirm to clear Database';
@@ -73,9 +66,9 @@ app.use(
 
 // Static for branding
 app.use('/static', express.static(path.join(__dirname, 'static')));
-// Scrape jobs (in-memory per-process)
-const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error }
 
+// Scrape jobs (in-memory per-process)
+const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc }
 
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -179,16 +172,15 @@ function pageHead(title) {
 }
 function renderPage(title, content, req) {
   const nav = req.session?.loggedIn
-  ? `<nav>
-      <a href="/add">Import</a>
-      <a href="/format">Format & Take</a>
-      <a href="/scrape">Scrape & Format IG</a>
-      <a href="/revert">Revert</a>
-      <a href="/kpi">KPI</a>
-      <a href="/admin">Admin</a>
-      <a href="/logout">Logout</a>
-    </nav>` : '';
-
+    ? `<nav>
+        <a href="/add">Import</a>
+        <a href="/format">Format & Take</a>
+        <a href="/scrape">Scrape & Format IG</a>
+        <a href="/revert">Revert</a>
+        <a href="/kpi">KPI</a>
+        <a href="/admin">Admin</a>
+        <a href="/logout">Logout</a>
+      </nav>` : '';
   return `<!DOCTYPE html>
   <html lang="en">
   <head>${pageHead(title)}</head>
@@ -235,6 +227,7 @@ async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
     await Log.create({ action, details, actor_type, actor_name });
   } catch (e) { console.error('Log error:', e); }
 }
+
 // ---- IG Scraper helpers ----
 if (!RAPIDAPI_KEY) console.warn('WARNING: RAPIDAPI_KEY missing – /scrape will fail until set.');
 
@@ -266,7 +259,7 @@ async function fetchProfile(username) {
   return p;
 }
 
-// Map to Airtable-aligned CSV fields (plus Username first)
+// Map API → Airtable-style CSV (Username first)
 function mapToCsvRow(p, inputUsername) {
   const media_count =
     p.media_count ??
@@ -297,7 +290,6 @@ function mapToCsvRow(p, inputUsername) {
     'Private?': isPrivate ? 'TRUE' : 'FALSE'
   };
 }
-
 
 // ===== Auth middleware =====
 function requireUser(req, res, next) {
@@ -513,6 +505,7 @@ app.get('/add', (req, res) => {
       </form>
       <div class="actions">
         <a href="/format">Format & Take</a>
+        <a href="/scrape">Scrape & Format IG</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin panel</a>
@@ -732,6 +725,159 @@ app.post('/download', (req, res) => {
   res.send(data);
 });
 
+// ===== Scrape & Format IG (new) =====
+app.get('/scrape', (req, res) => {
+  const html = renderPage(
+    'Scrape & Format IG',
+    `
+    <div class="card">
+      <form id="scrapeForm" enctype="multipart/form-data">
+        <label>Upload a .txt with one Instagram username per line</label>
+        <input type="file" name="file" accept=".txt" required />
+        <div class="row">
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="${SCRAPE_DELAY_MS}"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="5" value="${SCRAPE_CONCURRENCY}"/></div>
+        </div>
+        <button type="submit">Start Scrape</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <label>Progress</label>
+      <div id="bar" style="height:16px;background:#0f172f;border:1px solid #223064;border-radius:8px;overflow:hidden;">
+        <div id="fill" style="height:100%;width:0%;background:linear-gradient(90deg,#6a0dad,#52118e);"></div>
+      </div>
+      <div class="muted" id="meta" style="margin-top:8px;">0%</div>
+      <div id="doneBox" style="display:none;margin-top:10px;">
+        <a id="dl" href="#" class="muted">Download CSV</a>
+      </div>
+    </div>
+
+    <script>
+      const form = document.getElementById('scrapeForm');
+      const fill = document.getElementById('fill');
+      const meta = document.getElementById('meta');
+      const doneBox = document.getElementById('doneBox');
+      const dl = document.getElementById('dl');
+
+      form.addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        doneBox.style.display = 'none';
+        fill.style.width = '0%';
+        meta.textContent = '0%';
+
+        const fd = new FormData(form);
+        const r = await fetch('/scrape/start', { method:'POST', body: fd });
+        const j = await r.json();
+        if(!j.ok){ alert('Error: '+(j.error||'unknown')); return; }
+
+        const job = j.jobId;
+
+        const timer = setInterval(async ()=>{
+          const s = await fetch('/scrape/status?job='+encodeURIComponent(job)).then(r=>r.json()).catch(()=>null);
+          if(!s) return;
+          const pct = s.total ? Math.round((s.done/s.total)*100) : 0;
+          fill.style.width = pct+'%';
+          const eta = s.eta_s != null ? s.eta_s : 0;
+          meta.textContent = pct+'%  '+s.done+'/'+s.total+'  ETA '+(eta>60?Math.round(eta/60)+'m':Math.round(eta)+'s');
+
+          if(s.status==='done'){
+            clearInterval(timer);
+            fill.style.width = '100%';
+            meta.textContent = '100%  '+s.done+'/'+s.total+'  Completed';
+            dl.href = '/scrape/download?job='+encodeURIComponent(job);
+            doneBox.style.display = 'block';
+          }
+          if(s.status==='error'){
+            clearInterval(timer);
+            alert('Scrape failed: '+s.error);
+          }
+        }, 600);
+      });
+    </script>
+    `,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/scrape/start', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
+    const delay = Math.max(0, parseInt(req.body.delay || SCRAPE_DELAY_MS, 10));
+    const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 5));
+
+    const content = req.file.buffer.toString('utf8');
+    const usernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    if (!usernames.length) return res.json({ ok:false, error:'Empty file' });
+
+    const jobId = crypto.randomBytes(8).toString('hex');
+    const job = { total: usernames.length, done: 0, start: Date.now(), rows: [], status: 'running', error: null, delay, conc };
+    scrapeJobs.set(jobId, job);
+
+    // background worker
+    (async () => {
+      const queue = usernames.slice();
+      const workers = new Array(job.conc).fill(0).map(async () => {
+        while (queue.length) {
+          const u = queue.shift();
+          try {
+            const p = await fetchProfile(u);
+            const row = mapToCsvRow(p, u);
+            job.rows.push(row);
+          } catch (e) {
+            job.rows.push({
+              'Username': u, 'Name':'', 'Media Count':null, 'Followers Ordered':null, 'Followers':null, 'Following':null, 'Link in bio?':'FALSE', 'Private?':'FALSE', _error: e.message
+            });
+          } finally {
+            job.done++;
+            if (job.delay) await sleep(job.delay);
+          }
+        }
+      });
+
+      try {
+        await Promise.all(workers);
+        job.status = 'done';
+      } catch (e) {
+        job.status = 'error';
+        job.error = e.message;
+      }
+    })();
+
+    res.json({ ok:true, jobId });
+  } catch (e) {
+    res.json({ ok:false, error:e.message });
+  }
+});
+
+app.get('/scrape/status', (req, res) => {
+  const id = (req.query.job || '').trim();
+  const job = scrapeJobs.get(id);
+  if (!job) return res.json({ ok:false, error:'job not found' });
+  const elapsed = (Date.now() - job.start) / 1000;
+  const rate = job.done > 0 ? job.done / elapsed : 0;
+  const remaining = Math.max(0, job.total - job.done);
+  const eta_s = rate > 0 ? remaining / rate : null;
+  res.json({ ok:true, status: job.status, done: job.done, total: job.total, eta_s, error: job.error || null });
+});
+
+app.get('/scrape/download', (req, res) => {
+  const id = (req.query.job || '').trim();
+  const job = scrapeJobs.get(id);
+  if (!job || job.status !== 'done') return res.status(404).send('Job not ready');
+
+  const fields = ['Username','Name','Media Count','Followers Ordered','Followers','Following','Link in bio?','Private?'];
+  const example = job.rows.find(r => Object.keys(r).some(k => k.startsWith('_'))) || {};
+  const extra = Object.keys(example).filter(k => !fields.includes(k));
+  const parser = new Parser({ fields: fields.concat(extra) });
+
+  const csv = parser.parse(job.rows);
+  res.setHeader('Content-Disposition', `attachment; filename="profiles_${Date.now()}.csv"`);
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.send(csv);
+});
+
 // ===== Revert last actions (per VA shows their own 10) =====
 app.get('/revert', async (req, res) => {
   const who = req.session?.vaName;
@@ -832,7 +978,7 @@ app.post('/kpi', async (req, res) => {
         <tbody>${rows || '<tr><td colspan="7">No activities in range.</td></tr>'}</tbody>
       </table>
       <div class="notice" style="margin-top:10px;">
-        <div id="kpiOut">A=0; Total=0</div> <!-- B removed from summary as requested -->
+        <div id="kpiOut">A=0; Total=0</div> <!-- B removed from summary -->
       </div>
       <script>
         function recalc(){
