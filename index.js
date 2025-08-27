@@ -104,9 +104,11 @@ const modelSchema = new mongoose.Schema({
 const vaSchema = new mongoose.Schema({
   name: { type: String, unique: true, required: true, trim: true },
   password_hash: { type: String, required: true },
-  isAdmin: { type: Boolean, default: false }, // <— VA can be admin
+  // role: 'admin' | 'management' | 'va'
+  role: { type: String, enum: ['admin', 'management', 'va'], default: 'va' },
   created_at: { type: Date, default: Date.now },
 });
+
 
 // track take activity for revert + KPI
 const activitySchema = new mongoose.Schema({
@@ -130,6 +132,16 @@ const Activity = mongoose.model('Activity', activitySchema);
 const presence = new Map(); // sessionId -> { name, when }
 
 // ===== View helpers =====
+function isAdmin(req)       { return req.session?.role === 'admin'; }
+function isManagement(req)  { return req.session?.role === 'management'; }
+function isVA(req)          { return req.session?.role === 'va'; }
+
+// VA-only can access just this set:
+const VA_ALLOWED_PATHS = new Set([
+  '/mass-follow-formatter', '/presence/ping', '/presence/list', '/logout', '/health', '/static'
+]);
+
+
 function pageHead(title) {
   return `
     <meta charset="UTF-8" />
@@ -171,19 +183,50 @@ function pageHead(title) {
   `;
 }
 function renderPage(title, content, req) {
-  const nav = req.session?.loggedIn
-    ? `<nav>
+  const role = req.session?.role || null;
+
+  let nav = '';
+  if (req.session?.loggedIn) {
+    if (isVA(req)) {
+      nav = `<nav>
+        <a href="/mass-follow-formatter">Mass follow formatter</a>
+        <a href="/logout">Logout</a>
+      </nav>`;
+    } else if (isManagement(req)) {
+      nav = `<nav>
+        <a href="/add">Import</a>
+        <a href="/format">Format & Take</a>
+        <a href="/scrape">Scrape & Format IG</a>
+        <a href="/revert">Revert</a>
+        <a href="/kpi">KPI</a>
+        <a href="/mass-follow-formatter">Mass follow formatter</a>
+        <a href="/logout">Logout</a>
+      </nav>`;
+    } else if (isAdmin(req)) {
+      nav = `<nav>
         <a href="/add">Import</a>
         <a href="/format">Format & Take</a>
         <a href="/scrape">Scrape & Format IG</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin</a>
+        <a href="/mass-follow-formatter">Mass follow formatter</a>
         <a href="/logout">Logout</a>
-      </nav>` : '';
+      </nav>`;
+    }
+  }
+
   return `<!DOCTYPE html>
   <html lang="en">
-  <head>${pageHead(title)}</head>
+  <head>
+    ${pageHead(title)}
+    <style>
+      .presence .p { margin:2px 0; }
+      .presence .r-admin { color:#ff6868; font-weight:800; }
+      .presence .r-mgmt { color:#85ff8f; font-weight:700; }
+      .presence .r-va { color:#e8ebf5; opacity:.85; }
+    </style>
+  </head>
   <body>
     <div class="container">
       <header>
@@ -193,11 +236,32 @@ function renderPage(title, content, req) {
       ${nav}
       ${content}
     </div>
+
     <div class="presence" id="presenceBox" style="display:none">
       <h4>Online now</h4>
       <div id="presenceList">—</div>
     </div>
+
     <script>
+      // presence
+      fetch('/presence/ping',{method:'POST', headers:{'Content-Type':'application/json'}}).catch(()=>{});
+      setInterval(()=>{ fetch('/presence/ping',{method:'POST', headers:{'Content-Type':'application/json'}}).catch(()=>{}); }, 20000);
+
+      function renderPerson(p){
+        const cls = p.role==='admin' ? 'r-admin' : (p.role==='management' ? 'r-mgmt' : 'r-va');
+        return '<div class="p '+cls+'">• '+p.name+'</div>';
+      }
+      function refreshPresence(){
+        fetch('/presence/list').then(r=>r.json()).then(d=>{
+          const box=document.getElementById('presenceBox');
+          const list=document.getElementById('presenceList');
+          list.innerHTML = (d.people||[]).map(renderPerson).join('') || '—';
+          box.style.display='block';
+        }).catch(()=>{});
+      }
+      refreshPresence(); setInterval(refreshPresence,15000);
+
+      // clipboard helper
       function copyFrom(id){
         const el = document.getElementById(id);
         if(!el) return;
@@ -205,21 +269,11 @@ function renderPage(title, content, req) {
         if (navigator.clipboard) { navigator.clipboard.writeText(el.value).catch(()=>{}); }
         alert('Copied to clipboard');
       }
-      // presence
-      fetch('/presence/ping',{method:'POST', headers:{'Content-Type':'application/json'}}).catch(()=>{});
-      setInterval(()=>{ fetch('/presence/ping',{method:'POST', headers:{'Content-Type':'application/json'}}).catch(()=>{}); }, 20000);
-      function refreshPresence(){
-        fetch('/presence/list').then(r=>r.json()).then(d=>{
-          const box=document.getElementById('presenceBox');
-          const list=document.getElementById('presenceList');
-          list.innerHTML = (d.people||[]).map(p=>'• '+p).join('<br>') || '—';
-          box.style.display='block';
-        }).catch(()=>{});
-      }
-      refreshPresence(); setInterval(refreshPresence,15000);
+      window.copyFrom = copyFrom;
     </script>
   </body></html>`;
 }
+
 
 async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
   try {
@@ -299,10 +353,19 @@ function requireUser(req, res, next) {
   return res.redirect('/login');
 }
 function requireAdmin(req, res, next) {
-  if (req.session?.isAdmin) return next();
-  return res.redirect('/admin/login');
+  return isAdmin(req) ? next() : res.redirect('/admin/login');
 }
 app.use(requireUser);
+
+// VA: restrict pages
+app.use((req, res, next) => {
+  if (!isVA(req)) return next();
+  // allow only VA-allowed paths or exact matches
+  const p = req.path;
+  if (VA_ALLOWED_PATHS.has(p) || [...VA_ALLOWED_PATHS].some(base => p.startsWith(base))) return next();
+  return res.redirect('/mass-follow-formatter');
+});
+
 
 // ===== Health =====
 app.get('/health', (_req, res) => res.send('ok'));
@@ -328,33 +391,33 @@ app.get('/login', (req, res) => {
 app.post('/login', async (req, res) => {
   const pwd = (req.body.password || '').trim();
 
-  // Admin works here too (instant admin)
+  // Admin password
   if (pwd === ADMIN_PASSWORD) {
     req.session.loggedIn = true;
-    req.session.isAdmin = true;
-    req.session.vaName = null;
+    req.session.role = 'admin';
+    req.session.vaName = 'Admin';
     await logEvent({ action: 'admin_login_via_main', req, actor_type: 'admin' });
     return res.redirect('/admin');
   }
 
-  // Site-wide access password
+  // Management (site-wide access) password
   if (pwd === USER_PASSWORD) {
     req.session.loggedIn = true;
-    req.session.isAdmin = false;
-    req.session.vaName = null;
-    await logEvent({ action: 'user_login', req, actor_type: 'user' });
+    req.session.role = 'management';
+    req.session.vaName = 'Management';
+    await logEvent({ action: 'management_login', req, actor_type: 'user' });
     return res.redirect('/add');
   }
 
-  // VA login (bcrypt) — elevate if VA.isAdmin
+  // VA login (bcrypt) — role from DB
   const vaUsers = await VAUser.find({}).lean();
   for (const v of vaUsers) {
     if (await bcrypt.compare(pwd, v.password_hash)) {
       req.session.loggedIn = true;
-      req.session.isAdmin = !!v.isAdmin;
+      req.session.role = v.role || 'va';
       req.session.vaName = v.name;
-      await logEvent({ action: 'va_login', req, actor_type: req.session.isAdmin ? 'admin' : 'va', details: { va: v.name } });
-      return res.redirect(req.session.isAdmin ? '/admin' : '/add');
+      await logEvent({ action: 'va_login', req, actor_type: v.role === 'admin' ? 'admin' : (v.role === 'management' ? 'user' : 'va'), details: { va: v.name, role: v.role } });
+      return res.redirect(isVA({ session: { role: v.role } }) ? '/mass-follow-formatter' : (v.role === 'admin' ? '/admin' : '/add'));
     }
   }
 
@@ -373,19 +436,29 @@ app.get('/logout', async (req, res) => {
 
 // ===== Presence =====
 app.post('/presence/ping', (req, res) => {
-  const name = req.session?.vaName || (req.session?.isAdmin ? 'Admin' : 'User');
-  if (req.sessionID) presence.set(req.sessionID, { name, when: Date.now() });
+  const name = req.session?.vaName || (isAdmin(req) ? 'Admin' : isManagement(req) ? 'Management' : 'VA');
+  const role = req.session?.role || (req.session?.isAdmin ? 'admin' : 'management');
+  if (req.sessionID) presence.set(req.sessionID, { name, role, when: Date.now() });
   res.json({ ok: true });
 });
+
 app.get('/presence/list', (_req, res) => {
   const now = Date.now();
   const list = [];
   for (const [sid, info] of presence.entries()) {
-    if (now - info.when <= PRESENCE_TTL_MS) list.push(info.name);
+    if (now - info.when <= PRESENCE_TTL_MS) list.push({ name: info.name, role: info.role || 'va' });
     else presence.delete(sid);
   }
-  res.json({ people: [...new Set(list)] });
+  // de-dup by name+role
+  const uniq = [];
+  const seen = new Set();
+  for (const p of list) {
+    const k = p.name + '|' + p.role;
+    if (!seen.has(k)) { uniq.push(p); seen.add(k); }
+  }
+  res.json({ people: uniq });
 });
+
 
 // ===== Home redirect =====
 app.get('/', (_req, res) => res.redirect('/add'));
@@ -442,7 +515,7 @@ app.get('/admin/users', requireAdmin, async (req, res) => {
   const rows = users.map(u => `
     <tr>
       <td>${u.name}</td>
-      <td>${u.isAdmin ? 'Yes' : 'No'}</td>
+      <td>${u.role}</td>
       <td class="actions">
         <form action="/admin/users/delete" method="post" style="display:inline">
           <input type="hidden" name="name" value="${u.name}"/>
@@ -452,45 +525,49 @@ app.get('/admin/users', requireAdmin, async (req, res) => {
     </tr>`).join('');
 
   const html = renderPage(
-    'VA Users',
+    'Employees',
     `
     <div class="card">
       <form action="/admin/users/add" method="post" class="row">
-        <div><input type="text" name="name" placeholder="VA name" required /></div>
+        <div><input type="text" name="name" placeholder="Employee name" required /></div>
         <div><input type="password" name="password" placeholder="New/Update password" required /></div>
-        <div style="display:flex;align-items:center;gap:6px;">
-          <input type="checkbox" id="isAdmin" name="isAdmin"/><label for="isAdmin">Admin</label>
+        <div>
+          <label>Role</label>
+          <select name="role" required>
+            <option value="va">va (aging)</option>
+            <option value="management">management</option>
+            <option value="admin">admin</option>
+          </select>
         </div>
-        <div><button type="submit">Add / Update</button></div>
+        <div style="display:flex;align-items:end;"><button type="submit">Add / Update</button></div>
       </form>
-      <p class="muted">Passwords are hashed with bcrypt.</p>
+      <p class="muted">Passwords are hashed with bcrypt. Role controls access:
+      <b>admin</b> (red, full), <b>management</b> (green, no admin panel), <b>va</b> (black, Mass follow formatter only).</p>
       <p><a href="/admin">Back to Admin</a></p>
     </div>
     <div class="card">
-      <table><thead><tr><th>VA</th><th>Admin</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="3">No VAs yet.</td></tr>'}</tbody></table>
+      <table><thead><tr><th>Name</th><th>Role</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="3">No employees yet.</td></tr>'}</tbody></table>
     </div>`,
     req
   );
   res.send(html);
 });
+
 app.post('/admin/users/add', requireAdmin, async (req, res) => {
   const name = (req.body.name || '').trim();
-  const pwd = (req.body.password || '').trim();
-  const isAdmin = !!req.body.isAdmin;
+  const pwd  = (req.body.password || '').trim();
+  const role = (req.body.role || 'va').trim();
   if (!name || !pwd) return res.redirect('/admin/users');
   const hash = await bcrypt.hash(pwd, 10);
-  await VAUser.updateOne({ name }, { $set: { password_hash: hash, isAdmin } }, { upsert: true });
-  await logEvent({ action: 'admin_va_add_or_update', req, actor_type: 'admin', details: { name, isAdmin } });
+  await VAUser.updateOne(
+    { name },
+    { $set: { password_hash: hash, role } },
+    { upsert: true }
+  );
+  await logEvent({ action: 'admin_employee_add_or_update', req, actor_type: 'admin', details: { name, role } });
   res.redirect('/admin/users');
 });
-app.post('/admin/users/delete', requireAdmin, async (req, res) => {
-  const name = (req.body.name || '').trim();
-  if (name) {
-    await VAUser.deleteOne({ name });
-    await logEvent({ action: 'admin_va_delete', req, actor_type: 'admin', details: { name } });
-  }
-  res.redirect('/admin/users');
-});
+
 
 // ===== Import usernames =====
 app.get('/add', (req, res) => {
@@ -570,6 +647,60 @@ app.get('/inventory/:model', async (req, res) => {
   const unusedForModel = model ? await Username.countDocuments({ used_by: { $ne: model } }) : total;
   res.json({ total, unusedForModel });
 });
+// ===== Mass follow order formatter (VA-only page, but visible to others too) =====
+const MASS_PREFIX = process.env.MASS_PREFIX || '5566'; // constant at line start
+
+app.get('/mass-follow-formatter', (req, res) => {
+  const html = renderPage(
+    'Mass follow order formatter',
+    `
+    <div class="card">
+      <form id="mfForm">
+        <label>Paste Instagram links (one per line)</label>
+        <textarea id="mfInput" placeholder="instagram.com/lilpuffbynat&#10;instagram.com/cutecoastnat&#10;instagram.com/icingonbynat"></textarea>
+
+        <div class="row">
+          <div><label>Min followers</label><input id="minF" type="number" value="175" min="1"/></div>
+          <div><label>Max followers</label><input id="maxF" type="number" value="215" min="1"/></div>
+        </div>
+
+        <button type="submit">Format</button>
+      </form>
+    </div>
+
+    <div class="card">
+      <label>Result</label>
+      <textarea id="mfOut" readonly placeholder="Result will appear here..."></textarea>
+      <div class="actions"><button type="button" onclick="copyFrom('mfOut')">Copy to clipboard</button></div>
+      <div class="muted">Lines will be formatted as: <code>${MASS_PREFIX} | instagram.com/handle | N</code>, where N is a random integer in your range.</div>
+    </div>
+
+    <script>
+      function randInt(min, max){ min=Math.floor(min); max=Math.floor(max); return Math.floor(Math.random()*(max-min+1))+min; }
+      function cleanLine(s){
+        s = (s||'').trim();
+        if(!s) return '';
+        // allow with/without protocol and @
+        s = s.replace(/^https?:\\/\\//i,'').replace(/^www\\./i,'').replace(/^@/,'');
+        if(!s.toLowerCase().startsWith('instagram.com/')) s = 'instagram.com/'+s;
+        return s;
+      }
+      document.getElementById('mfForm').addEventListener('submit', (e)=>{
+        e.preventDefault();
+        const raw = document.getElementById('mfInput').value || '';
+        const min = parseInt(document.getElementById('minF').value||'175',10);
+        const max = parseInt(document.getElementById('maxF').value||'215',10);
+        const lines = raw.split(/\\r?\\n/).map(cleanLine).filter(Boolean);
+        const out = lines.map(link => '${MASS_PREFIX} | '+link+' | '+randInt(min,max)).join('\\n');
+        document.getElementById('mfOut').value = out;
+      });
+    </script>
+    `,
+    req
+  );
+  res.send(html);
+});
+
 
 // ===== Format & Take =====
 async function fetchInventoryCounts(model) {
