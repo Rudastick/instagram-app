@@ -447,6 +447,16 @@ class RateLimiter {
       failures: this.circuitBreaker.failures
     };
   }
+
+  clearQueue() {
+    // Reject all pending requests in the queue
+    while (this.requestQueue.length > 0) {
+      const { reject } = this.requestQueue.shift();
+      reject(new Error('Request cancelled - job cleared'));
+    }
+    this.activeRequests = 0;
+    this.requestTimes = [];
+  }
 }
 
 // Global rate limiter instance
@@ -1599,6 +1609,9 @@ app.post('/scrape/cancel', (req, res) => {
         globalAbortController = null;
       }
       
+      // Clear rate limiter queue for this job
+      rateLimiter.clearQueue();
+      
       job.status = 'cancelled';
       job.error = 'Cancelled by user';
       jobCancelled = true; // Set flag to stop background processing
@@ -1634,6 +1647,9 @@ app.post('/scrape/clear-all', (req, res) => {
   activeScrapeJob = null;
   jobCancelled = true; // Set flag to stop any remaining background processing
   
+  // Clear rate limiter queue and reset active requests
+  rateLimiter.clearQueue();
+  
   // Reset rate limiter circuit breaker
   rateLimiter.circuitBreaker = {
     failures: 0,
@@ -1643,8 +1659,8 @@ app.post('/scrape/clear-all', (req, res) => {
     timeout: 60000
   };
   
-  console.log('All jobs cleared, all requests aborted, cache reset, and rate limiter reset');
-  res.json({ ok: true, message: 'All jobs cleared, all requests aborted, API cache reset, and rate limiter reset' });
+  console.log('All jobs cleared, all requests aborted, rate limiter queue cleared, cache reset, and rate limiter reset');
+  res.json({ ok: true, message: 'All jobs cleared, all requests aborted, rate limiter queue cleared, API cache reset, and rate limiter reset' });
 });
 
 app.get('/scrape/active', (req, res) => {
