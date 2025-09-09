@@ -1223,6 +1223,44 @@ app.get('/admin', requireAdmin, async (req, res) => {
     </div>
 
     <div class="card">
+      <h2>Webhook Test</h2>
+      <p class="muted">Test the Airtable webhook integration to verify automation triggers.</p>
+      <button type="button" id="webhookTestBtn" onclick="testWebhook()">Send Test Webhook</button>
+      <div id="webhookResult" style="margin-top:10px; display:none;"></div>
+      <script>
+        async function testWebhook() {
+          const btn = document.getElementById('webhookTestBtn');
+          const result = document.getElementById('webhookResult');
+          
+          btn.disabled = true;
+          btn.textContent = 'Sending...';
+          result.style.display = 'block';
+          result.innerHTML = '<div class="muted">Sending webhook test...</div>';
+          
+          try {
+            const response = await fetch('/admin/webhook-test', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' }
+            });
+            
+            const data = await response.json();
+            
+            if (data.success) {
+              result.innerHTML = '<div style="color: #85ff8f; font-weight: bold;">✓ Webhook sent successfully! Check Airtable for automation trigger.</div>';
+            } else {
+              result.innerHTML = '<div style="color: #ff6868; font-weight: bold;">✗ Webhook failed: ' + (data.error || 'Unknown error') + '</div>';
+            }
+          } catch (error) {
+            result.innerHTML = '<div style="color: #ff6868; font-weight: bold;">✗ Network error: ' + error.message + '</div>';
+          } finally {
+            btn.disabled = false;
+            btn.textContent = 'Send Test Webhook';
+          }
+        }
+      </script>
+    </div>
+
+    <div class="card">
       <h2>Danger zone</h2>
       <form action="/admin/clear" method="post">
         <label class="muted">Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></label>
@@ -1234,6 +1272,71 @@ app.get('/admin', requireAdmin, async (req, res) => {
     req
   );
   res.send(html);
+});
+
+// Admin webhook test endpoint
+app.post('/admin/webhook-test', requireAdmin, async (req, res) => {
+  const webhookUrl = 'https://hooks.airtable.com/workflows/v1/genericWebhook/appbEq0KfnMOT94rZ/wfl2Aj2X2yOfuPAsG/wtrq63viCi6Pu14YV';
+  
+  try {
+    const testData = {
+      test: true,
+      timestamp: new Date().toISOString(),
+      source: 'BlueMagic Admin Panel',
+      message: 'Test webhook from BlueMagic Instagram Username Manager'
+    };
+
+    const response = await fetch(webhookUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(testData)
+    });
+
+    const responseData = await response.json();
+    
+    if (response.ok && responseData.success === true) {
+      await logEvent({ 
+        action: 'admin_webhook_test_success', 
+        req, 
+        actor_type: 'admin', 
+        details: { 
+          webhook_url: webhookUrl,
+          response_status: response.status,
+          response_data: responseData
+        } 
+      });
+      
+      res.json({ success: true, message: 'Webhook sent successfully', response: responseData });
+    } else {
+      await logEvent({ 
+        action: 'admin_webhook_test_failed', 
+        req, 
+        actor_type: 'admin', 
+        details: { 
+          webhook_url: webhookUrl,
+          response_status: response.status,
+          response_data: responseData,
+          error: 'Invalid response from webhook'
+        } 
+      });
+      
+      res.json({ success: false, error: 'Webhook returned invalid response', response: responseData });
+    }
+  } catch (error) {
+    await logEvent({ 
+      action: 'admin_webhook_test_error', 
+      req, 
+      actor_type: 'admin', 
+      details: { 
+        webhook_url: webhookUrl,
+        error: error.message 
+      } 
+    });
+    
+    res.json({ success: false, error: error.message });
+  }
 });
 
 // Admin logs
