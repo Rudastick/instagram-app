@@ -354,20 +354,14 @@ function pickProfile(payload) {
 }
 
 async function fetchProfile(username, retries = 3) {
-  // Check cache first
-  const cacheKey = username.toLowerCase();
-  const cached = requestCache.get(cacheKey);
-  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
-    performanceStats.cacheHits++;
-    return cached.data;
-  }
-
   performanceStats.totalRequests++;
   performanceStats.lastRequestTime = Date.now();
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+      console.log(`Fetching profile for ${username} (attempt ${attempt}/${retries})`);
+      
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
       
@@ -381,9 +375,12 @@ async function fetchProfile(username, retries = 3) {
       
       clearTimeout(timeoutId);
       
+      console.log(`Response status: ${res.status} for ${username}`);
+      
       if (!res.ok) {
         if (res.status === 429) { // Rate limited
           const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+          console.log(`Rate limited for ${username}, waiting ${delay}ms`);
           await sleep(delay);
           continue;
         }
@@ -395,24 +392,22 @@ async function fetchProfile(username, retries = 3) {
       try { 
         json = JSON.parse(text); 
       } catch (e) {
+        console.log(`JSON parse error for ${username}: ${text.slice(0,120)}`);
         throw new Error(`Non-JSON: ${text.slice(0,120)}`);
       }
       
       const p = pickProfile(json);
       if (!p || typeof p !== 'object') {
+        console.log(`No profile object for ${username}:`, json);
         throw new Error('No profile object');
       }
 
-      // Cache successful result
-      requestCache.set(cacheKey, {
-        data: p,
-        timestamp: Date.now()
-      });
-
+      console.log(`Successfully fetched profile for ${username}`);
       performanceStats.successfulRequests++;
       return p;
       
     } catch (error) {
+      console.log(`Error fetching ${username} (attempt ${attempt}):`, error.message);
       if (attempt === retries) {
         performanceStats.failedRequests++;
         throw error;
@@ -420,6 +415,7 @@ async function fetchProfile(username, retries = 3) {
       
       // Exponential backoff with jitter
       const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+      console.log(`Retrying ${username} in ${delay}ms`);
       await sleep(delay);
     }
   }
@@ -472,7 +468,7 @@ app.get('/scrape', (req, res) => {
         </div>
         <div class="row">
           <div><label>Retry attempts</label><input type="number" name="retries" min="1" max="5" value="3"/></div>
-          <div><label>Cache duration (min)</label><input type="number" name="cacheDuration" min="1" max="60" value="5"/></div>
+          <div></div>
         </div>
         <button type="submit" id="startBtn">Start Scrape</button>
         <button type="button" id="stopBtn" style="display:none;background:linear-gradient(180deg,#d64b4b,#a52929);">Stop Scraping</button>
@@ -490,9 +486,7 @@ app.get('/scrape', (req, res) => {
         <div class="grid-3" style="font-size:12px;">
           <div class="kpi-pill">✓ <span id="successCount">0</span> Success</div>
           <div class="kpi-pill">✗ <span id="errorCount">0</span> Errors</div>
-          <div class="kpi-pill">🚀 <span id="cacheHits">0</span> Cache Hits</div>
           <div class="kpi-pill">📊 <span id="requestRate">0</span> req/s</div>
-          <div class="kpi-pill">🔄 <span id="duplicatesRemoved">0</span> Duplicates</div>
           <div class="kpi-pill">⏱️ <span id="elapsedTime">0s</span> Elapsed</div>
         </div>
       </div>
@@ -519,8 +513,6 @@ app.get('/scrape', (req, res) => {
       function updateStats(data) {
         document.getElementById('successCount').textContent = data.successfulRequests || 0;
         document.getElementById('errorCount').textContent = data.failedRequests || 0;
-        document.getElementById('cacheHits').textContent = data.cacheHits || 0;
-        document.getElementById('duplicatesRemoved').textContent = data.duplicatesRemoved || 0;
         
         const elapsed = data.elapsedTime || 0;
         const rate = elapsed > 0 ? (data.totalRequests / elapsed).toFixed(1) : 0;
@@ -633,28 +625,23 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
     const delay = Math.max(0, parseInt(req.body.delay || '100', 10));
     const conc = Math.max(1, Math.min(parseInt(req.body.conc || '4', 10), 8));
     const retries = Math.max(1, Math.min(parseInt(req.body.retries || '3', 10), 5));
-    const cacheDuration = Math.max(1, Math.min(parseInt(req.body.cacheDuration || '5', 10), 60));
 
     const content = req.file.buffer.toString('utf8');
-    const rawUsernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    if (!rawUsernames.length) return res.json({ ok:false, error:'Empty file' });
-
-    // Remove duplicates and track count
-    const uniqueUsernames = [...new Set(rawUsernames.map(u => u.toLowerCase()))];
-    const duplicatesRemoved = rawUsernames.length - uniqueUsernames.length;
+    const usernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    if (!usernames.length) return res.json({ ok:false, error:'Empty file' });
 
     // Reset performance stats
     performanceStats.totalRequests = 0;
     performanceStats.successfulRequests = 0;
     performanceStats.failedRequests = 0;
     performanceStats.cacheHits = 0;
-    performanceStats.duplicatesRemoved = duplicatesRemoved;
+    performanceStats.duplicatesRemoved = 0;
     performanceStats.startTime = Date.now();
     performanceStats.lastRequestTime = null;
 
     const jobId = crypto.randomBytes(8).toString('hex');
     const job = { 
-      total: uniqueUsernames.length, 
+      total: usernames.length, 
       done: 0, 
       start: Date.now(), 
       rows: [], 
@@ -663,13 +650,12 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       delay, 
       conc, 
       retries,
-      cacheDuration,
       stopped: false,
       stats: {
         successfulRequests: 0,
         failedRequests: 0,
         cacheHits: 0,
-        duplicatesRemoved,
+        duplicatesRemoved: 0,
         totalRequests: 0,
         elapsedTime: 0
       }
@@ -680,7 +666,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
 
     // background worker
     (async () => {
-      const queue = uniqueUsernames.slice();
+      const queue = usernames.slice();
       const workers = new Array(job.conc).fill(0).map(async () => {
         while (queue.length && !job.stopped) {
           const u = queue.shift();
