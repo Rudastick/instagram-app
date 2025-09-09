@@ -1475,6 +1475,29 @@ app.get('/scrape/test-status', (req, res) => {
 async function runPerformanceTests(testId, usernames) {
   const testJob = testJobs.get(testId);
   
+  // First, test basic API connectivity with a simple request
+  console.log('Testing API connectivity...');
+  const fallbackUsernames = ['instagram', 'cristiano', 'therock', 'selenagomez', 'kyliejenner'];
+  let testUsernames = usernames;
+  
+  try {
+    const testUsername = usernames[0] || 'instagram';
+    await fetchProfile(testUsername, 1); // Single retry for connectivity test
+    console.log('API connectivity test passed with uploaded usernames');
+  } catch (e) {
+    console.log('Uploaded usernames failed, trying fallback usernames...');
+    try {
+      await fetchProfile('instagram', 1);
+      testUsernames = fallbackUsernames; // Use fallback usernames
+      console.log('API connectivity test passed with fallback usernames');
+    } catch (e2) {
+      console.error('API connectivity test failed:', e2.message);
+      testJob.status = 'error';
+      testJob.error = `API connectivity failed: ${e2.message}. Check your RAPIDAPI_KEY and network connection.`;
+      return;
+    }
+  }
+  
   // Test configurations optimized for 30 req/s rate limit: [delay, concurrency]
   const testConfigs = [
     // Conservative settings (well under rate limit)
@@ -1493,7 +1516,7 @@ async function runPerformanceTests(testId, usernames) {
     testJob.completed = i;
     
     try {
-      const result = await testConfiguration(usernames, delay, concurrency);
+      const result = await testConfiguration(testUsernames, delay, concurrency);
       testJob.results.push({
         delay,
         concurrency,
@@ -1520,10 +1543,23 @@ async function runPerformanceTests(testId, usernames) {
   const validResults = testJob.results.filter(r => r.successRate > 0);
   console.log(`Test run completed. Valid results: ${validResults.length}/${testJob.results.length}`);
   
+  // Log detailed error information
+  const failedResults = testJob.results.filter(r => r.successRate === 0);
+  if (failedResults.length > 0) {
+    console.log('Failed configurations:', failedResults.map(r => ({
+      delay: r.delay,
+      concurrency: r.concurrency,
+      errors: r.errors
+    })));
+  }
+  
   if (validResults.length === 0) {
     testJob.status = 'error';
-    testJob.error = 'All test configurations failed';
-    console.log('All test configurations failed');
+    const errorSummary = failedResults.length > 0 ? 
+      `All test configurations failed. Common errors: ${[...new Set(failedResults.flatMap(r => r.errors))].join(', ')}` :
+      'All test configurations failed';
+    testJob.error = errorSummary;
+    console.log('All test configurations failed:', errorSummary);
     return;
   }
 
