@@ -128,6 +128,35 @@ const Model = mongoose.model('Model', modelSchema);
 const VAUser = mongoose.model('VAUser', vaSchema);
 const Activity = mongoose.model('Activity', activitySchema);
 
+// ===== X (Twitter) Schemas =====
+const usernameXSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true, lowercase: true, trim: true },
+  date_added: { type: Date, default: Date.now },
+  used_by: { type: [String], default: [] },
+  last_used_at: { type: Date, default: null },
+  last_used_by: { type: String, default: null },
+});
+
+const modelXSchema = new mongoose.Schema({
+  name: { type: String, unique: true, required: true, trim: true },
+  created_at: { type: Date, default: Date.now },
+});
+
+const activityXSchema = new mongoose.Schema({
+  ts: { type: Date, default: Date.now },
+  model: { type: String, required: true },
+  va: { type: String, default: null },
+  accounts: { type: Number, required: true }, // A
+  per_line: { type: Number, required: true }, // B
+  total_usernames: { type: Number, required: true }, // A*B actually assigned
+  username_ids: { type: [mongoose.Schema.Types.ObjectId], default: [] },
+  undone: { type: Boolean, default: false },
+});
+
+const UsernameX = mongoose.model('UsernameX', usernameXSchema);
+const ModelX = mongoose.model('ModelX', modelXSchema);
+const ActivityX = mongoose.model('ActivityX', activityXSchema);
+
 // ===== Presence (in-memory) =====
 const presence = new Map(); // sessionId -> { name, when }
 
@@ -200,6 +229,7 @@ function renderPage(title, content, req) {
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/mass-follow-formatter">Mass follow formatter</a>
+        <a href="/x" style="background: linear-gradient(180deg,#1da1f2,#0d8bd9);">X</a>
         <a href="/logout">Logout</a>
       </nav>`;
     } else if (isAdmin(req)) {
@@ -211,6 +241,7 @@ function renderPage(title, content, req) {
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin</a>
         <a href="/mass-follow-formatter">Mass follow formatter</a>
+        <a href="/x" style="background: linear-gradient(180deg,#1da1f2,#0d8bd9);">X</a>
         <a href="/logout">Logout</a>
       </nav>`;
     }
@@ -1337,6 +1368,365 @@ app.post('/admin/clear', requireAdmin, async (req, res) => {
   const del = await Username.deleteMany({});
   await logEvent({ action: 'admin_clear_db', req, actor_type: 'admin', details: { deleted: del.deletedCount } });
   res.send(renderPage('Database Cleared', `<div class="notice">Deleted ${del.deletedCount} usernames.</div><p><a href="/admin">Back to Admin</a></p>`, req));
+});
+
+// ===== X (Twitter) Panel Routes =====
+app.get('/x', (req, res) => {
+  const html = renderPage(
+    'X (Twitter) Panel',
+    `
+    <div class="card">
+      <h2>X (Twitter) Management</h2>
+      <p class="muted">Manage X usernames and activities. Same functionality as Instagram but for X platform.</p>
+      <div class="actions">
+        <a href="/x/add">Import X Usernames</a>
+        <a href="/x/format">Format & Take X</a>
+        <a href="/x/kpi">X KPI</a>
+        <a href="/x/admin">X Admin Panel</a>
+      </div>
+    </div>
+    `,
+    req
+  );
+  res.send(html);
+});
+
+// X Import usernames
+app.get('/x/add', (req, res) => {
+  const html = renderPage(
+    'Import X Usernames',
+    `
+    <div class="card">
+      <form action="/x/add" method="post" enctype="multipart/form-data">
+        <label>Upload a .txt file with one X username per line:</label>
+        <input type="file" name="file" accept=".txt" required />
+        <button type="submit">Import X Usernames</button>
+      </form>
+      <div class="actions">
+        <a href="/x/format">Format & Take X</a>
+        <a href="/x/kpi">X KPI</a>
+        <a href="/x/admin">X Admin Panel</a>
+      </div>
+      <div class="muted">Duplicates ignored automatically.</div>
+    </div>`,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/x/add', upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).send('No file uploaded');
+
+  const content = req.file.buffer.toString('utf-8');
+  const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  const ops = lines.map((raw) => {
+    const username = raw.toLowerCase().replace(/^@/, '');
+    return {
+      updateOne: {
+        filter: { username },
+        update: { $setOnInsert: { username, date_added: new Date(), used_by: [] } },
+        upsert: true,
+      },
+    };
+  });
+
+  let inserted = 0;
+  try {
+    const result = await UsernameX.bulkWrite(ops, { ordered: false });
+    inserted = result.upsertedCount || 0;
+  } catch (_) {}
+  const duplicates = lines.length - inserted;
+
+  await logEvent({
+    action: 'import_x_usernames',
+    details: { processed: lines.length, inserted, duplicates },
+    req,
+    actor_type: req.session?.vaName ? 'va' : 'user',
+  });
+
+  const html = renderPage(
+    'Import X Usernames Result',
+    `
+    <div class="notice">
+      <p>Processed ${lines.length} X usernames.</p>
+      <p>Inserted ${inserted} new entries.</p>
+      <p>Detected ${duplicates} duplicates.</p>
+    </div>
+    <p><a href="/x/add">Back to Import X</a></p>
+    <p><a href="/x/format">Go to Format & Take X Usernames</a></p>`,
+    req
+  );
+  res.send(html);
+});
+
+// X Format & Take (placeholder for now)
+app.get('/x/format', (req, res) => {
+  const html = renderPage(
+    'Format & Take X Usernames',
+    `
+    <div class="card">
+      <h2>Format & Take X Usernames</h2>
+      <p class="muted">This functionality will be implemented later. For now, this is a placeholder.</p>
+      <div class="actions">
+        <a href="/x/add">Import X Usernames</a>
+        <a href="/x/kpi">X KPI</a>
+        <a href="/x/admin">X Admin Panel</a>
+      </div>
+    </div>`,
+    req
+  );
+  res.send(html);
+});
+
+// X KPI (placeholder for now)
+app.get('/x/kpi', (req, res) => {
+  const html = renderPage(
+    'X KPI',
+    `
+    <div class="card">
+      <h2>X KPI</h2>
+      <p class="muted">This functionality will be implemented later. For now, this is a placeholder.</p>
+      <div class="actions">
+        <a href="/x/add">Import X Usernames</a>
+        <a href="/x/format">Format & Take X</a>
+        <a href="/x/admin">X Admin Panel</a>
+      </div>
+    </div>`,
+    req
+  );
+  res.send(html);
+});
+
+// X Admin Panel
+app.get('/x/admin', requireAdmin, async (req, res) => {
+  const total = await UsernameX.countDocuments({});
+  const models = await ModelX.find({}).sort({ name: 1 }).lean();
+
+  // per-model counts
+  let modelRows = '';
+  for (const m of models) {
+    const used = await UsernameX.countDocuments({ used_by: m.name });
+    const unused = await UsernameX.countDocuments({ used_by: { $ne: m.name } });
+    modelRows += `<tr><td>${m.name}</td><td>${used}</td><td>${unused}</td></tr>`;
+  }
+
+  const html = renderPage(
+    'X Admin Panel',
+    `
+    <div class="card">
+      <h2>X Metrics</h2>
+      <div class="kpi-pill">Total X usernames: ${total}</div>
+      <table style="margin-top:10px;"><thead><tr><th>Model</th><th>Used</th><th>Unused</th></tr></thead><tbody>${modelRows || '<tr><td colspan="3">No models yet.</td></tr>'}</tbody></table>
+    </div>
+
+    <div class="grid-3">
+      <div class="card">
+        <h2>Export CSV</h2>
+        <p class="muted">Filter and export X database slices to CSV.</p>
+        <a href="/x/admin/export">Open Export</a>
+      </div>
+
+      <div class="card">
+        <h2>Manage Models</h2>
+        <p class="muted">Add or delete X models.</p>
+        <a href="/x/admin/models">Open Models</a>
+      </div>
+
+      <div class="card">
+        <h2>Manage VA Users</h2>
+        <p class="muted">Create VA accounts and toggle Admin role.</p>
+        <a href="/admin/users">Open Users</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Logs</h2>
+      <div class="actions">
+        <a href="/admin/logs">View latest logs</a>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Sync used X usernames (by model)</h2>
+      <form action="/x/admin/upload-used" method="post" enctype="multipart/form-data" class="row">
+        <div>
+          <label>Model</label>
+          <select name="model" required>
+            ${models.length ? models.map(m => `<option value="${m.name}">${m.name}</option>`).join('') : '<option value="Natalie">Natalie</option>'}
+          </select>
+        </div>
+        <div>
+          <label>File (.txt)</label>
+          <input type="file" name="file" accept=".txt" required />
+        </div>
+        <div style="display:flex; align-items:end;"><button type="submit">Sync</button></div>
+      </form>
+    </div>
+
+    <div class="card">
+      <h2>Danger zone</h2>
+      <form action="/x/admin/clear" method="post">
+        <label class="muted">Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></label>
+        <input type="text" name="confirm" placeholder="${CLEAR_CONFIRM_TEXT}" required />
+        <button type="submit" class="danger">Clear X Database</button>
+      </form>
+      <p class="muted">Deletes <b>all</b> X usernames. Logs remain.</p>
+    </div>`,
+    req
+  );
+  res.send(html);
+});
+
+// X Models CRUD (Admin)
+app.get('/x/admin/models', requireAdmin, async (req, res) => {
+  const models = await ModelX.find({}).sort({ name: 1 }).lean();
+  const rows = models.map(m => `<tr>
+      <td>${m.name}</td>
+      <td class="actions">
+        <form action="/x/admin/models/delete" method="post" style="display:inline">
+          <input type="hidden" name="name" value="${m.name}"/>
+          <button class="danger">Delete</button>
+        </form>
+      </td>
+    </tr>`).join('');
+  const html = renderPage(
+    'X Models',
+    `
+    <div class="card">
+      <form action="/x/admin/models/add" method="post" class="actions">
+        <input type="text" name="name" placeholder="New X model name" required />
+        <button type="submit">Add X model</button>
+        <a href="/x/admin">Back to X Admin</a>
+      </form>
+    </div>
+    <div class="card">
+      <table><thead><tr><th>X Model</th><th>Actions</th></tr></thead><tbody>${rows || '<tr><td colspan="2">No X models yet.</td></tr>'}</tbody></table>
+    </div>`,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/x/admin/models/add', requireAdmin, async (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (name) {
+    await ModelX.updateOne({ name }, { $setOnInsert: { name } }, { upsert: true });
+    await logEvent({ action: 'admin_x_model_add', req, actor_type: 'admin', details: { name } });
+  }
+  res.redirect('/x/admin/models');
+});
+
+app.post('/x/admin/models/delete', requireAdmin, async (req, res) => {
+  const name = (req.body.name || '').trim();
+  if (name) {
+    await ModelX.deleteOne({ name });
+    await logEvent({ action: 'admin_x_model_delete', req, actor_type: 'admin', details: { name } });
+  }
+  res.redirect('/x/admin/models');
+});
+
+// X CSV export UI + POST
+app.get('/x/admin/export', requireAdmin, (_req, res) => {
+  res.send(renderPage(
+    'Export X CSV',
+    `
+    <div class="card">
+      <form action="/x/admin/export" method="post" class="row">
+        <div><label>Filter by model (optional):</label><input type="text" name="model" placeholder="e.g. Natalie" /></div>
+        <div><label>Used status:</label>
+          <select name="status">
+            <option value="any">Any</option>
+            <option value="unused">Unused by model</option>
+            <option value="used_by_model">Used by model</option>
+            <option value="used_by_any">Used by any model</option>
+          </select>
+        </div>
+        <div><label>From date (optional):</label><input type="date" name="from" /></div>
+        <div><label>To date (optional):</label><input type="date" name="to" /></div>
+        <div><label>Limit:</label><input type="number" name="limit" min="1" value="1000" /></div>
+        <div style="display:flex; align-items:end;"><button type="submit">Export X CSV</button></div>
+      </form>
+      <p class="muted">CSV: username, date_added, used_by, last_used_at, last_used_by</p>
+    </div>
+    <p><a href="/x/admin">Back to X Admin</a></p>`,
+    _req
+  ));
+});
+
+app.post('/x/admin/export', requireAdmin, async (req, res) => {
+  const { model = '', status = 'any', from = '', to = '', limit = '1000' } = req.body;
+  const q = {};
+  if (from || to) q.date_added = {};
+  if (from) q.date_added.$gte = new Date(from);
+  if (to) q.date_added.$lte = new Date(to + 'T23:59:59.999Z');
+
+  if (status === 'unused' && model) q.used_by = { $ne: model };
+  if (status === 'used_by_model' && model) q.used_by = model;
+  if (status === 'used_by_any') q.used_by = { $exists: true, $ne: [] };
+
+  const lim = Math.max(1, Math.min(parseInt(limit, 10) || 1000, 100000));
+  const docs = await UsernameX.find(q).sort({ date_added: -1 }).limit(lim).lean();
+
+  await logEvent({ action: 'admin_export_x_csv', req, actor_type: 'admin', details: { count: docs.length, query: q } });
+
+  let csv = 'username,date_added,used_by,last_used_at,last_used_by\n';
+  for (const d of docs) {
+    const used = (d.used_by || []).join('|');
+    csv += `${d.username},${new Date(d.date_added).toISOString()},${used},${d.last_used_at ? new Date(d.last_used_at).toISOString() : ''},${d.last_used_by || ''}\n`;
+  }
+  res.setHeader('Content-Disposition', `attachment; filename="x_export_${Date.now()}.csv"`);
+  res.setHeader('Content-Type', 'text/csv');
+  res.send(csv);
+});
+
+// Sync Used X (Admin) with model SELECT
+app.post('/x/admin/upload-used', requireAdmin, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).send('No file uploaded');
+  const model = (req.body.model || 'Natalie').trim();
+  const content = req.file.buffer.toString('utf-8');
+  const lines = content.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+
+  let updated = 0, inserted = 0;
+  for (const raw of lines) {
+    const username = raw.toLowerCase().replace(/^@/, '');
+    try {
+      const existing = await UsernameX.findOne({ username });
+      if (existing) {
+        await UsernameX.updateOne({ _id: existing._id }, { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } });
+        updated++;
+      } else {
+        await UsernameX.create({ username, used_by: [model], last_used_at: new Date(), last_used_by: model });
+        inserted++;
+      }
+    } catch (e) { console.error(e); }
+  }
+  await logEvent({ action: 'admin_sync_used_x', req, actor_type: 'admin', details: { model, processed: lines.length, updated, inserted } });
+
+  res.send(renderPage(
+    'Sync Used X Usernames Result',
+    `
+    <div class="notice">
+      <p>Model: ${model}</p>
+      <p>Processed ${lines.length} X usernames.</p>
+      <p>Updated ${updated} existing entries.</p>
+      <p>Inserted ${inserted} new entries.</p>
+    </div>
+    <p><a href="/x/admin">Back to X Admin</a></p>`,
+    req
+  ));
+});
+
+// Clear X DB
+app.post('/x/admin/clear', requireAdmin, async (req, res) => {
+  const confirm = (req.body.confirm || '').trim();
+  if (confirm !== CLEAR_CONFIRM_TEXT) {
+    return res.status(400).send(renderPage('Clear X Database',
+      `<div class="notice">Confirmation text mismatch. Type exactly: <b>${CLEAR_CONFIRM_TEXT}</b></div><p><a href="/x/admin">Back to X Admin</a></p>`, req));
+  }
+  const del = await UsernameX.deleteMany({});
+  await logEvent({ action: 'admin_clear_x_db', req, actor_type: 'admin', details: { deleted: del.deletedCount } });
+  res.send(renderPage('X Database Cleared', `<div class="notice">Deleted ${del.deletedCount} X usernames.</div><p><a href="/x/admin">Back to X Admin</a></p>`, req));
 });
 
 // ===== Start =====
