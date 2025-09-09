@@ -69,6 +69,33 @@ app.use('/static', express.static(path.join(__dirname, 'static')));
 let currentScrapeJob = null;
 let scrapeStartTime = null;
 
+// Rate limiting tracking
+let requestCount = 0;
+let rateLimitResetTime = Date.now() + 1000; // Reset every second
+
+// Rate limiting function
+async function waitForRateLimit() {
+  const now = Date.now();
+  
+  // Reset counter if a second has passed
+  if (now >= rateLimitResetTime) {
+    requestCount = 0;
+    rateLimitResetTime = now + 1000;
+  }
+  
+  // If we've hit the rate limit, wait until next second
+  if (requestCount >= 30) {
+    const waitTime = rateLimitResetTime - now;
+    if (waitTime > 0) {
+      await new Promise(resolve => setTimeout(resolve, waitTime));
+      requestCount = 0;
+      rateLimitResetTime = Date.now() + 1000;
+    }
+  }
+  
+  requestCount++;
+}
+
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -312,24 +339,61 @@ async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
   } catch (e) { console.error('Log error:', e); }
 }
 
-// Simple Instagram API helper
-async function fetchProfile(username) {
+// Enhanced Instagram API helper with timeout, retry, and rate limiting
+async function fetchProfile(username, retries = 2) {
   const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
   
-  const res = await fetch(url, {
-    headers: {
-      'x-rapidapi-host': RAPIDAPI_HOST,
-      'x-rapidapi-key': RAPIDAPI_KEY,
-      'User-Agent': 'Mozilla/5.0 (compatible; InstagramScraper/1.0)'
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      // Wait for rate limit availability
+      await waitForRateLimit();
+      
+      // Create AbortController for timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000); // 6 second timeout (reduced further)
+      
+      const res = await fetch(url, {
+        headers: {
+          'x-rapidapi-host': RAPIDAPI_HOST,
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'User-Agent': 'Mozilla/5.0 (compatible; InstagramScraper/1.0)',
+          'Accept': 'application/json',
+          'Cache-Control': 'no-cache',
+          'Connection': 'keep-alive'
+        },
+        signal: controller.signal,
+        method: 'GET'
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!res.ok) {
+        if (res.status === 429) {
+          // Rate limited - wait longer before retry
+          if (attempt < retries) {
+            await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
+            continue;
+          }
+        }
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      
+      const json = await res.json();
+      return json;
+      
+    } catch (error) {
+      if (error.name === 'AbortError') {
+        throw new Error(`Request timeout for @${username}`);
+      }
+      
+      if (attempt === retries) {
+        throw error;
+      }
+      
+      // Wait before retry (exponential backoff)
+      await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
     }
-  });
-  
-  if (!res.ok) {
-    throw new Error(`HTTP ${res.status}: ${res.statusText}`);
   }
-  
-  const json = await res.json();
-  return json;
 }
 
 // ===== New Simple Scrape & Format IG =====
@@ -342,11 +406,13 @@ app.get('/scrape', (req, res) => {
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="50" title="Delay between requests"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="10" value="6" title="Number of concurrent requests"/></div>
+          <div><label>Delay per batch (ms)</label><input type="number" name="delay" min="0" value="0" title="Delay between batches (0 = no delay)"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="30" value="25" title="Number of concurrent requests (max 30/sec)"/></div>
         </div>
+        <div class="muted" style="margin-top:8px;">API Rate Limit: 30 requests/second | Optimized settings: 25 concurrent, 0ms delay</div>
         <div class="actions">
           <button type="button" id="checkTasksBtn">Check Running Tasks</button>
+          <button type="button" id="testApiBtn">Test API Health</button>
           <button type="button" id="closeAllBtn" style="display:none; background: linear-gradient(180deg,#dc3545,#c82333);">Close All Tasks</button>
           <button type="button" id="startScrapeBtn">Start Scrape</button>
         </div>
@@ -377,6 +443,7 @@ app.get('/scrape', (req, res) => {
         const dl = document.getElementById('dl');
         const startScrapeBtn = document.getElementById('startScrapeBtn');
         const checkTasksBtn = document.getElementById('checkTasksBtn');
+        const testApiBtn = document.getElementById('testApiBtn');
         const closeAllBtn = document.getElementById('closeAllBtn');
         const progressCard = document.getElementById('progressCard');
 
@@ -398,6 +465,28 @@ app.get('/scrape', (req, res) => {
             }
           } catch (error) {
             alert('Error checking tasks: ' + error.message);
+          }
+        });
+
+        // Test API health
+        testApiBtn.addEventListener('click', async () => {
+          testApiBtn.disabled = true;
+          testApiBtn.textContent = 'Testing...';
+          
+          try {
+            const response = await fetch('/scrape/api-health');
+            const result = await response.json();
+            
+            if (result.ok) {
+              alert('API Health Check:\n\nResponse Time: ' + result.responseTime + 'ms\nUsername: @' + result.profile.username + '\nFollowers: ' + result.profile.followers.toLocaleString() + '\nAPI Key: ' + result.apiKey + '\nAPI Host: ' + result.apiHost);
+            } else {
+              alert('API Health Check Failed:\n\nError: ' + result.error + '\nAPI Key: ' + result.apiKey + '\nAPI Host: ' + result.apiHost);
+            }
+          } catch (error) {
+            alert('Error testing API: ' + error.message);
+          } finally {
+            testApiBtn.disabled = false;
+            testApiBtn.textContent = 'Test API Health';
           }
         });
 
@@ -493,10 +582,10 @@ app.get('/scrape', (req, res) => {
                   statusText += ' | Success rate: ' + s.successRate + '%';
                 }
                 
-                // Add processing rate
+                // Add processing rate and rate limit info
                 if (elapsed > 0) {
                   const rate = (s.done / elapsed).toFixed(1);
-                  statusText += ' | Rate: ' + rate + '/sec';
+                  statusText += ' | Rate: ' + rate + '/sec (max 30/sec)';
                 }
                 
                 if (s.completedUsernames && s.completedUsernames.length > 0) {
@@ -559,8 +648,8 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       });
     }
     
-    const delay = Math.max(0, parseInt(req.body.delay || '50', 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '6', 10), 10));
+    const delay = Math.max(0, parseInt(req.body.delay || '0', 10));
+    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '25', 10), 30));
 
     const content = req.file.buffer.toString('utf8');
     const usernames = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -589,22 +678,34 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
         const processUsername = async (username, index) => {
           if (currentScrapeJob.status !== 'running') return;
           
+          const startTime = Date.now();
           currentScrapeJob.currentUsername = username;
           
           try {
             const profile = await fetchProfile(username);
+            const processingTime = Date.now() - startTime;
+            
             const row = {
               'Username': username,
               'Name': profile.full_name || profile.name || '',
               'Followers': profile.followers_count || profile.follower_count || 0,
               'Following': profile.following_count || 0,
               'Media Count': profile.media_count || 0,
-              'Private': profile.is_private ? 'TRUE' : 'FALSE'
+              'Private': profile.is_private ? 'TRUE' : 'FALSE',
+              'Processing Time (ms)': processingTime
             };
             
             currentScrapeJob.rows[index] = row;
             currentScrapeJob.completedUsernames.push(username);
+            
+            // Log slow requests
+            if (processingTime > 5000) {
+              console.log(`Slow request: @${username} took ${processingTime}ms`);
+            }
+            
           } catch (error) {
+            const processingTime = Date.now() - startTime;
+            
             const row = {
               'Username': username,
               'Name': '',
@@ -612,11 +713,14 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
               'Following': 0,
               'Media Count': 0,
               'Private': 'FALSE',
-              'Error': error.message
+              'Error': error.message,
+              'Processing Time (ms)': processingTime
             };
             
             currentScrapeJob.rows[index] = row;
             currentScrapeJob.failedUsernames.push(username);
+            
+            console.log(`Failed request: @${username} - ${error.message} (${processingTime}ms)`);
           }
           
           currentScrapeJob.done++;
@@ -634,10 +738,8 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
           
           await Promise.all(promises);
           
-          // Add delay between batches (not individual requests)
-          if (delay > 0 && i + conc < usernames.length) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-          }
+          // No delay needed since we're handling rate limiting at request level
+          // The rate limiter ensures we stay within 30 req/sec
         }
         
         currentScrapeJob.status = 'done';
@@ -692,6 +794,36 @@ app.get('/scrape/check-tasks', (req, res) => {
     ok: true,
     hasTasks: !!currentScrapeJob
   });
+});
+
+// API health check for debugging
+app.get('/scrape/api-health', async (req, res) => {
+  try {
+    const testUsername = 'instagram'; // Use a known working username
+    const startTime = Date.now();
+    
+    const profile = await fetchProfile(testUsername);
+    const responseTime = Date.now() - startTime;
+    
+    res.json({
+      ok: true,
+      responseTime: responseTime,
+      profile: {
+        username: profile.username || 'N/A',
+        followers: profile.followers_count || profile.follower_count || 0,
+        hasData: !!(profile.username || profile.full_name)
+      },
+      apiKey: RAPIDAPI_KEY ? 'Configured' : 'Missing',
+      apiHost: RAPIDAPI_HOST
+    });
+  } catch (error) {
+    res.json({
+      ok: false,
+      error: error.message,
+      apiKey: RAPIDAPI_KEY ? 'Configured' : 'Missing',
+      apiHost: RAPIDAPI_HOST
+    });
+  }
 });
 
 app.post('/scrape/close-all', (req, res) => {
