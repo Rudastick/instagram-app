@@ -313,6 +313,9 @@ async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
 }
 
 // Simple Instagram API helper
+
+
+// Simple Instagram API helper
 async function fetchProfile(username) {
   const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
   
@@ -331,305 +334,290 @@ async function fetchProfile(username) {
   const json = await res.json();
   return json;
 }
+  constructor(maxRequestsPerSecond = 25, maxConcurrent = 3) {
+    this.maxRequestsPerSecond = maxRequestsPerSecond;
+    this.maxConcurrent = maxConcurrent;
+    this.requestQueue = [];
+    this.activeRequests = 0;
+    this.lastRequestTime = 0;
+    this.requestTimes = []; // Track request times for rate limiting
+    this.circuitBreaker = {
+      failures: 0,
+      lastFailureTime: 0,
+      state: 'CLOSED', // CLOSED, OPEN, HALF_OPEN
+      threshold: 5,
+      timeout: 60000 // 1 minute
+    };
+  }
 
-// ===== New Simple Scrape & Format IG =====
-app.get('/scrape', (req, res) => {
-  const html = renderPage(
-    'Scrape & Format IG',
-    `
-    <div class="card">
-      <form id="scrapeForm" method="POST" enctype="multipart/form-data">
-        <label>Upload a .txt with one Instagram username per line</label>
-        <input type="file" name="file" accept=".txt" required />
-        <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="135" title="Delay between requests"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="8" value="4" title="Number of concurrent requests"/></div>
-        </div>
-        <div class="actions">
-          <button type="button" id="checkTasksBtn">Check Running Tasks</button>
-          <button type="button" id="closeAllBtn" style="display:none; background: linear-gradient(180deg,#dc3545,#c82333);">Close All Tasks</button>
-          <button type="button" id="startScrapeBtn">Start Scrape</button>
-        </div>
-      </form>
-    </div>
+  async makeRequest(requestFn) {
+    return new Promise((resolve, reject) => {
+      this.requestQueue.push({ requestFn, resolve, reject });
+      this.processQueue();
+    });
+  }
 
-    <div class="card" id="progressCard" style="display:none;">
-      <label>Progress</label>
-      <div id="bar" style="height:16px;background:#0f172f;border:1px solid #223064;border-radius:8px;overflow:hidden;">
-        <div id="fill" style="height:100%;width:0%;background:linear-gradient(90deg,#6a0dad,#52118e);"></div>
-      </div>
-      <div class="muted" id="meta" style="margin-top:8px;">0%</div>
-      <div id="timeDisplay" style="margin-top:8px; font-weight:bold; color:#6a0dad;">Time: 00:00</div>
-      <div id="doneBox" style="display:none;margin-top:10px;">
-        <a id="dl" href="#" class="muted">Download CSV</a>
-      </div>
-    </div>
+  async processQueue() {
+    if (this.activeRequests >= this.maxConcurrent || this.requestQueue.length === 0) {
+      return;
+    }
 
-    <script>
-      document.addEventListener('DOMContentLoaded', function() {
-        const form = document.getElementById('scrapeForm');
-        const fill = document.getElementById('fill');
-        const meta = document.getElementById('meta');
-        const timeDisplay = document.getElementById('timeDisplay');
-        const doneBox = document.getElementById('doneBox');
-        const dl = document.getElementById('dl');
-        const startScrapeBtn = document.getElementById('startScrapeBtn');
-        const checkTasksBtn = document.getElementById('checkTasksBtn');
-        const closeAllBtn = document.getElementById('closeAllBtn');
-        const progressCard = document.getElementById('progressCard');
-
-        let startTime = null;
-        let timeInterval = null;
-
-        // Check for running tasks on page load
-        checkTasksBtn.addEventListener('click', async () => {
-          try {
-            const response = await fetch('/scrape/check-tasks');
-            const result = await response.json();
-            if (result.ok && result.hasTasks) {
-              closeAllBtn.style.display = 'inline-block';
-              alert('Found running tasks from before. Click "Close All Tasks" to clear them.');
-            } else {
-              alert('No running tasks found.');
-            }
-          } catch (error) {
-            alert('Error checking tasks: ' + error.message);
-          }
-        });
-
-        // Close all tasks
-        closeAllBtn.addEventListener('click', async () => {
-          if (confirm('Are you sure you want to close all running tasks?')) {
-            try {
-              const response = await fetch('/scrape/close-all', { method: 'POST' });
-              const result = await response.json();
-              if (result.ok) {
-                closeAllBtn.style.display = 'none';
-                alert('All tasks closed successfully.');
+    // Check circuit breaker
+    if (this.circuitBreaker.state === 'OPEN') {
+      if (Date.now() - this.circuitBreaker.lastFailureTime > this.circuitBreaker.timeout) {
+        this.circuitBreaker.state = 'HALF_OPEN';
+        this.circuitBreaker.failures = 0;
       } else {
-                alert('Failed to close tasks: ' + result.error);
-              }
-            } catch (error) {
-              alert('Error closing tasks: ' + error.message);
-            }
-          }
-        });
+        // Still in open state, reject all requests
+        while (this.requestQueue.length > 0) {
+          const { reject } = this.requestQueue.shift();
+          reject(new Error('Circuit breaker is OPEN - API is temporarily unavailable'));
+        }
+        return;
+      }
+    }
 
-        // Start scraping
-        startScrapeBtn.addEventListener('click', async (e) => {
-          e.preventDefault();
-          progressCard.style.display = 'block';
-          doneBox.style.display = 'none';
-          fill.style.width = '0%';
-          meta.textContent = '0%';
-          startTime = Date.now();
-          
-          // Start time display
-          timeInterval = setInterval(() => {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const minutes = Math.floor(elapsed / 60);
-            const seconds = elapsed % 60;
-            timeDisplay.textContent = 'Time: ' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
-          }, 1000);
+    const { requestFn, resolve, reject } = this.requestQueue.shift();
+    this.activeRequests++;
 
-          const fd = new FormData(form);
-          try {
-            const r = await fetch('/scrape/start', { method: 'POST', body: fd });
-            const j = await r.json();
-            if (!j.ok) {
-              progressCard.style.display = 'none';
-              clearInterval(timeInterval);
-              alert('Error: ' + (j.error || 'unknown'));
-              return;
-            }
-
-            const jobId = j.jobId;
-            const timer = setInterval(async () => {
-              const s = await fetch('/scrape/status?job=' + encodeURIComponent(jobId)).then(r => r.json()).catch(() => null);
-              if (!s) return;
-              
-              const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
-              fill.style.width = pct + '%';
-              meta.textContent = pct + '% (' + s.done + '/' + s.total + ')';
-
-              if (s.status === 'done') {
-                clearInterval(timer);
-                clearInterval(timeInterval);
-                fill.style.width = '100%';
-                meta.textContent = '100% Completed';
-                dl.href = '/scrape/download?job=' + encodeURIComponent(jobId);
-                doneBox.style.display = 'block';
-              }
-              if (s.status === 'error') {
-                clearInterval(timer);
-                clearInterval(timeInterval);
-                alert('Scrape failed: ' + s.error);
-                progressCard.style.display = 'none';
-              }
-            }, 1000);
+    try {
+      // Rate limiting: ensure we don't exceed max requests per second
+      await this.enforceRateLimit();
+      
+      const result = await requestFn();
+      
+      // Reset circuit breaker on success
+      if (this.circuitBreaker.state === 'HALF_OPEN') {
+        this.circuitBreaker.state = 'CLOSED';
+        this.circuitBreaker.failures = 0;
+      }
+      
+      resolve(result);
     } catch (error) {
-            progressCard.style.display = 'none';
-            clearInterval(timeInterval);
-            alert('Network error: ' + error.message);
-          }
-        });
-      });
-    </script>
-    `,
-    req
-  );
-  res.send(html);
-});
+      this.handleRequestError(error);
+      reject(error);
+    } finally {
+      this.activeRequests--;
+      // Process next request in queue
+      setImmediate(() => this.processQueue());
+    }
+  }
 
-// API endpoints
-app.post('/scrape/start', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.json({ ok: false, error: 'No file uploaded' });
+  async enforceRateLimit() {
+    const now = Date.now();
     
-    if (currentScrapeJob) {
-      return res.json({ 
-        ok: false, 
-        error: 'Another scraping job is already running. Please wait for it to finish.' 
-      });
+    // Remove request times older than 1 second
+    this.requestTimes = this.requestTimes.filter(time => now - time < 1000);
+    
+    // If we're at the limit, wait
+    if (this.requestTimes.length >= this.maxRequestsPerSecond) {
+      const oldestRequest = Math.min(...this.requestTimes);
+      const waitTime = 1000 - (now - oldestRequest) + 10; // Add 10ms buffer
+      if (waitTime > 0) {
+        await sleep(waitTime);
+        return this.enforceRateLimit(); // Recursive call to recheck
+      }
     }
     
-    const delay = Math.max(0, parseInt(req.body.delay || '135', 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '4', 10), 8));
+    // Record this request time
+    this.requestTimes.push(now);
+  }
 
-    const content = req.file.buffer.toString('utf8');
-    const usernames = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    if (!usernames.length) return res.json({ ok: false, error: 'Empty file' });
+  handleRequestError(error) {
+    this.circuitBreaker.failures++;
+    this.circuitBreaker.lastFailureTime = Date.now();
+    
+    if (this.circuitBreaker.failures >= this.circuitBreaker.threshold) {
+      this.circuitBreaker.state = 'OPEN';
+      console.log('Circuit breaker opened due to repeated failures');
+    }
+  }
 
-    const jobId = crypto.randomBytes(8).toString('hex');
-    currentScrapeJob = {
-      id: jobId,
-      total: usernames.length,
-      done: 0,
-      start: Date.now(),
-      rows: [],
-      status: 'running',
-      error: null,
-      delay,
-      conc
+  getStatus() {
+    return {
+      queueLength: this.requestQueue.length,
+      activeRequests: this.activeRequests,
+      circuitBreakerState: this.circuitBreaker.state,
+      failures: this.circuitBreaker.failures
     };
-    scrapeStartTime = Date.now();
+  }
 
-    // Background processing
-    (async () => {
+  clearQueue() {
+    // Reject all pending requests in the queue
+    while (this.requestQueue.length > 0) {
+      const { reject } = this.requestQueue.shift();
+      reject(new Error('Request cancelled - job cleared'));
+    }
+    this.activeRequests = 0;
+    this.requestTimes = [];
+  }
+}
+
+// Global rate limiter instance
+const rateLimiter = new RateLimiter(25, 3); // 25 req/s max, 3 concurrent
+
+// Function to detect and clear orphaned tasks from previous app sessions
+function clearOrphanedTasks() {
+  console.log('Checking for orphaned tasks from previous sessions...');
+  
+  // Only clear if there are actually orphaned tasks (active requests but no tracked job)
+  if (rateLimiter.activeRequests > 0 && !activeScrapeJob) {
+    console.log('Found orphaned tasks, clearing...');
+    rateLimiter.clearQueue();
+  }
+  
+  // Don't reset jobCancelled to true as it breaks new jobs
+  // Don't clear scrapeJobs as it might contain valid jobs
+  // Don't reset activeScrapeJob as it might be valid
+  
+  console.log('Orphaned task check completed');
+}
+
+// Clear orphaned tasks on app start (but don't be too aggressive)
+clearOrphanedTasks();
+
+// Add a periodic check for orphaned tasks that might be running
+setInterval(() => {
+  const now = Date.now();
+  const timeSinceStart = now - appStartTime;
+  
+  // Only check for orphaned tasks if we've been running for more than 10 minutes
+  // and there are active requests but no tracked job
+  if (timeSinceStart > 10 * 60 * 1000 && rateLimiter.activeRequests > 0 && !activeScrapeJob) {
+    console.log('Detected potential orphaned tasks after 10 minutes - clearing rate limiter queue');
+    rateLimiter.clearQueue();
+  }
+}, 60 * 1000); // Check every 60 seconds (less frequent)
+
+
+function pickProfile(payload) {
+  if (payload && typeof payload === 'object') {
+    if (payload.data && typeof payload.data === 'object') return payload.data;
+    if (payload.profile && typeof payload.profile === 'object') return payload.profile;
+  }
+  return payload;
+}
+
+async function fetchProfile(username, retries = 3) {
+  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+  
+  // Use rate limiter to manage the request
+  return rateLimiter.makeRequest(async () => {
+    for (let attempt = 1; attempt <= retries; attempt++) {
       try {
-        for (let i = 0; i < usernames.length; i++) {
-          if (currentScrapeJob.status !== 'running') break;
-          
-          const username = usernames[i];
-          try {
-            const profile = await fetchProfile(username);
-            currentScrapeJob.rows.push({
-              'Username': username,
-              'Name': profile.full_name || profile.name || '',
-              'Followers': profile.followers_count || profile.follower_count || 0,
-              'Following': profile.following_count || 0,
-              'Media Count': profile.media_count || 0,
-              'Private': profile.is_private ? 'TRUE' : 'FALSE'
-            });
-          } catch (error) {
-            currentScrapeJob.rows.push({
-              'Username': username,
-              'Name': '',
-              'Followers': 0,
-              'Following': 0,
-              'Media Count': 0,
-              'Private': 'FALSE',
-              'Error': error.message
-            });
-          }
-          
-          currentScrapeJob.done++;
-          
-          // Add delay between requests
-          if (i < usernames.length - 1 && delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-          }
+        // Check for global cancellation before each attempt
+        if (jobCancelled || globalAbortController?.signal.aborted) {
+          throw new Error('Request cancelled by user');
         }
         
-        currentScrapeJob.status = 'done';
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 20000); // 20 second timeout
+        
+        // Create a combined abort signal that respects both timeout and global cancellation
+        const combinedSignal = AbortSignal.any([
+          controller.signal,
+          globalAbortController?.signal || new AbortController().signal
+        ]);
+        
+        const res = await fetch(url, {
+          headers: {
+            'x-rapidapi-host': RAPIDAPI_HOST,
+            'x-rapidapi-key': RAPIDAPI_KEY,
+            'User-Agent': 'Mozilla/5.0 (compatible; InstagramScraper/1.0)'
+          },
+          signal: combinedSignal
+        });
+        
+        clearTimeout(timeoutId);
+        
+        if (!res.ok) {
+          if (res.status === 429) { // Rate limited
+            const retryAfter = parseInt(res.headers.get('retry-after') || '60', 10);
+            console.log(`Rate limited for ${username}, waiting ${retryAfter}s`);
+            await sleep(retryAfter * 1000);
+            continue;
+          }
+          
+          if (res.status >= 500) {
+            // Server error, use exponential backoff
+            const delay = Math.min(1000 * Math.pow(2, attempt - 1), 30000);
+            console.log(`Server error ${res.status} for ${username}, waiting ${delay}ms`);
+            await sleep(delay);
+            continue;
+          }
+          
+          throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+        }
+        
+        const text = await res.text();
+        let json;
+        try { 
+          json = JSON.parse(text); 
+        } catch (e) {
+          // Check if response is HTML (common with API errors)
+          if (text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html')) {
+            throw new Error(`API returned HTML instead of JSON. This usually means the API endpoint is blocked or your API key is invalid. Response: ${text.slice(0,200)}`);
+          }
+          throw new Error(`Invalid JSON response: ${text.slice(0,120)}`);
+        }
+        
+        const p = pickProfile(json);
+        if (!p || typeof p !== 'object') {
+          throw new Error('No valid profile data in response');
+        }
+        
+        return p;
+        
       } catch (error) {
-        currentScrapeJob.status = 'error';
-        currentScrapeJob.error = error.message;
+        if (attempt === retries) {
+          throw error;
+        }
+        
+        // Exponential backoff with jitter for client errors
+        if (error.name === 'AbortError') {
+          console.log(`Request timeout for ${username}, attempt ${attempt}`);
+        } else {
+          console.log(`Attempt ${attempt} failed for ${username}:`, error.message);
+        }
+        
+        const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 30000);
+        await sleep(delay);
       }
-    })();
-
-    res.json({ ok: true, jobId });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/scrape/status', (req, res) => {
-  const jobId = req.query.job;
-  if (!currentScrapeJob || currentScrapeJob.id !== jobId) {
-    return res.json({ ok: false, error: 'Job not found' });
-  }
-  
-  res.json({
-    ok: true,
-    status: currentScrapeJob.status,
-    done: currentScrapeJob.done,
-    total: currentScrapeJob.total,
-    error: currentScrapeJob.error
+    }
   });
-});
+}
 
-app.get('/scrape/download', (req, res) => {
-  const jobId = req.query.job;
-  if (!currentScrapeJob || currentScrapeJob.id !== jobId || currentScrapeJob.status !== 'done') {
-    return res.status(404).send('Job not ready');
-  }
+// Map API → Airtable-style CSV (Username first)
+function mapToCsvRow(p, inputUsername) {
+  const media_count =
+    p.media_count ??
+    p.edge_owner_to_timeline_media?.count ??
+    p.timeline_media_count ?? null;
 
-  const fields = ['Username', 'Name', 'Followers', 'Following', 'Media Count', 'Private'];
-  const parser = new Parser({ fields });
-  const csv = parser.parse(currentScrapeJob.rows);
-  
-  res.setHeader('Content-Disposition', `attachment; filename="profiles_${Date.now()}.csv"`);
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.send(csv);
-});
+  const followers =
+    p.followers_count ??
+    p.follower_count ??
+    p.edge_followed_by?.count ?? null;
 
-app.get('/scrape/check-tasks', (req, res) => {
-  res.json({
-    ok: true,
-    hasTasks: !!currentScrapeJob
-  });
-});
+  const following =
+    p.following_count ??
+    p.edge_follow?.count ?? null;
 
-app.post('/scrape/close-all', (req, res) => {
-  if (currentScrapeJob) {
-    currentScrapeJob.status = 'cancelled';
-    currentScrapeJob = null;
-    scrapeStartTime = null;
-  }
-  
-  res.json({ ok: true, message: 'All tasks closed' });
-});
+  const bioLinksArr = Array.isArray(p.bio_links) ? p.bio_links : [];
+  const linkInBio = bioLinksArr.length > 0;
+  const isPrivate = !!(p.is_private);
 
-app.post('/scrape/delete', (req, res) => {
-  if (currentScrapeJob) {
-    currentScrapeJob = null;
-    scrapeStartTime = null;
-  }
-  
-  res.json({ ok: true, message: 'Current scrape deleted' });
-});
-// ===== Auth middleware =====
-
-
-
-
-
-
-
-
-
-
+  return {
+    'Username': inputUsername,
+    'Name': p.full_name || p.fullName || p.name || '',
+    'Media Count': media_count == null ? null : Number(media_count),
+    'Followers Ordered': followers == null ? null : Number(followers),
+    'Followers': followers == null ? null : Number(followers),
+    'Following': following == null ? null : Number(following),
+    'Link in bio?': linkInBio ? 'TRUE' : 'FALSE',
+    'Private?': isPrivate ? 'TRUE' : 'FALSE'
+  };
+}
 
 // ===== Auth middleware =====
 function requireUser(req, res, next) {
