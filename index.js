@@ -72,6 +72,7 @@ const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, er
 // Active job tracking (prevent multiple simultaneous jobs)
 let activeScrapeJob = null;
 let jobCancelled = false; // Flag to stop background processing
+let globalAbortController = null; // Global abort controller for cancelling all requests
 
 // Clean up old jobs periodically
 setInterval(() => {
@@ -467,8 +468,19 @@ async function fetchProfile(username, retries = 3) {
   return rateLimiter.makeRequest(async () => {
     for (let attempt = 1; attempt <= retries; attempt++) {
       try {
+        // Check for global cancellation before each attempt
+        if (jobCancelled || globalAbortController?.signal.aborted) {
+          throw new Error('Request cancelled by user');
+        }
+        
         const controller = new AbortController();
         const timeoutId = setTimeout(() => controller.abort(), 20000); // 20 second timeout
+        
+        // Create a combined abort signal that respects both timeout and global cancellation
+        const combinedSignal = AbortSignal.any([
+          controller.signal,
+          globalAbortController?.signal || new AbortController().signal
+        ]);
         
         const res = await fetch(url, {
           headers: {
@@ -476,7 +488,7 @@ async function fetchProfile(username, retries = 3) {
             'x-rapidapi-key': RAPIDAPI_KEY,
             'User-Agent': 'Mozilla/5.0 (compatible; InstagramScraper/1.0)'
           },
-          signal: controller.signal
+          signal: combinedSignal
         });
         
         clearTimeout(timeoutId);
@@ -1398,6 +1410,9 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
     scrapeJobs.set(jobId, job);
     activeScrapeJob = jobId; // Mark as active
     jobCancelled = false; // Reset cancellation flag
+    
+    // Create new abort controller for this job
+    globalAbortController = new AbortController();
 
     // background worker with improved concurrency
     (async () => {
@@ -1417,7 +1432,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
         
         const promises = batch.map(async (username) => {
           // Check for cancellation before each request
-          if (jobCancelled || job.status === 'cancelled') {
+          if (jobCancelled || job.status === 'cancelled' || globalAbortController?.signal.aborted) {
             return;
           }
           
@@ -1425,6 +1440,12 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
           
           try {
             const p = await fetchProfile(username, job.retries);
+            
+            // Check for cancellation after the request completes
+            if (jobCancelled || job.status === 'cancelled' || globalAbortController?.signal.aborted) {
+              return;
+            }
+            
             const row = mapToCsvRow(p, username);
             results[globalIndex] = row;
             
@@ -1432,6 +1453,11 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
             job.successCount++;
             
           } catch (e) {
+            // Don't process results if job was cancelled
+            if (jobCancelled || job.status === 'cancelled' || globalAbortController?.signal.aborted) {
+              return;
+            }
+            
             results[globalIndex] = {
               'Username': username, 
               'Name':'', 
@@ -1450,6 +1476,8 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
               console.log(`Circuit breaker active for ${username}`);
             } else if (e.message.includes('Rate limited')) {
               console.log(`Rate limited for ${username}`);
+            } else if (e.message.includes('cancelled by user')) {
+              console.log(`Request cancelled for ${username}`);
             }
           }
           
@@ -1464,7 +1492,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
         // Process in batches
         for (let i = 0; i < queue.length; i += batchSize) {
           // Check for cancellation before each batch
-          if (jobCancelled || job.status === 'cancelled') {
+          if (jobCancelled || job.status === 'cancelled' || globalAbortController?.signal.aborted) {
             console.log('Job cancelled, stopping main processing loop');
             job.status = 'cancelled';
             job.error = 'Cancelled by user';
@@ -1474,6 +1502,15 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
           
           const batch = queue.slice(i, i + batchSize);
           await processBatch(batch);
+          
+          // Check for cancellation after each batch
+          if (jobCancelled || job.status === 'cancelled' || globalAbortController?.signal.aborted) {
+            console.log('Job cancelled after batch processing');
+            job.status = 'cancelled';
+            job.error = 'Cancelled by user';
+            activeScrapeJob = null;
+            return;
+          }
           
           // Add delay between batches to prevent rate limiting
           if (i + batchSize < queue.length && job.delay) {
@@ -1556,6 +1593,12 @@ app.post('/scrape/cancel', (req, res) => {
   if (activeScrapeJob) {
     const job = scrapeJobs.get(activeScrapeJob);
     if (job && job.status === 'running') {
+      // Abort all running requests immediately
+      if (globalAbortController) {
+        globalAbortController.abort();
+        globalAbortController = null;
+      }
+      
       job.status = 'cancelled';
       job.error = 'Cancelled by user';
       jobCancelled = true; // Set flag to stop background processing
@@ -1571,6 +1614,12 @@ app.post('/scrape/cancel', (req, res) => {
 });
 
 app.post('/scrape/clear-all', (req, res) => {
+  // Abort all running requests immediately
+  if (globalAbortController) {
+    globalAbortController.abort();
+    globalAbortController = null;
+  }
+  
   // Cancel active job
   if (activeScrapeJob) {
     const job = scrapeJobs.get(activeScrapeJob);
@@ -1583,8 +1632,7 @@ app.post('/scrape/clear-all', (req, res) => {
   // Clear all jobs
   scrapeJobs.clear();
   activeScrapeJob = null;
-  jobCancelled = false; // Reset flag for fresh start
-  
+  jobCancelled = true; // Set flag to stop any remaining background processing
   
   // Reset rate limiter circuit breaker
   rateLimiter.circuitBreaker = {
@@ -1595,8 +1643,8 @@ app.post('/scrape/clear-all', (req, res) => {
     timeout: 60000
   };
   
-  console.log('All jobs cleared, cache reset, and rate limiter reset');
-  res.json({ ok: true, message: 'All jobs cleared, API cache reset, and rate limiter reset' });
+  console.log('All jobs cleared, all requests aborted, cache reset, and rate limiter reset');
+  res.json({ ok: true, message: 'All jobs cleared, all requests aborted, API cache reset, and rate limiter reset' });
 });
 
 app.get('/scrape/active', (req, res) => {
