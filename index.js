@@ -73,6 +73,7 @@ const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, er
 let activeScrapeJob = null;
 let jobCancelled = false; // Flag to stop background processing
 let globalAbortController = null; // Global abort controller for cancelling all requests
+let appStartTime = Date.now(); // Track when the app started to detect orphaned tasks
 
 // Clean up old jobs periodically
 setInterval(() => {
@@ -461,6 +462,45 @@ class RateLimiter {
 
 // Global rate limiter instance
 const rateLimiter = new RateLimiter(25, 3); // 25 req/s max, 3 concurrent
+
+// Function to detect and clear orphaned tasks from previous app sessions
+function clearOrphanedTasks() {
+  console.log('Checking for orphaned tasks from previous sessions...');
+  
+  // Clear any existing rate limiter queue that might be from previous session
+  rateLimiter.clearQueue();
+  
+  // Reset all tracking variables
+  activeScrapeJob = null;
+  jobCancelled = true; // Set to true to stop any orphaned background processing
+  
+  // Clear any existing jobs that might be from previous session
+  scrapeJobs.clear();
+  
+  // Reset global abort controller
+  if (globalAbortController) {
+    globalAbortController.abort();
+    globalAbortController = null;
+  }
+  
+  console.log('Orphaned tasks cleared, ready for new jobs');
+}
+
+// Clear orphaned tasks on app start
+clearOrphanedTasks();
+
+// Add a periodic check for orphaned tasks that might be running
+setInterval(() => {
+  const now = Date.now();
+  const timeSinceStart = now - appStartTime;
+  
+  // If we've been running for more than 5 minutes and there are active requests but no tracked job,
+  // it might be an orphaned task
+  if (timeSinceStart > 5 * 60 * 1000 && rateLimiter.activeRequests > 0 && !activeScrapeJob) {
+    console.log('Detected potential orphaned tasks - clearing rate limiter queue');
+    rateLimiter.clearQueue();
+  }
+}, 30 * 1000); // Check every 30 seconds
 
 
 function pickProfile(payload) {
@@ -1192,6 +1232,7 @@ app.get('/scrape', (req, res) => {
           <button type="submit">Start Scrape</button>
           <button type="button" id="cancelBtn" style="background: linear-gradient(180deg,#dc3545,#c82333); display:none;">Cancel Current Job</button>
           <button type="button" id="clearAllBtn" style="background: linear-gradient(180deg,#6c757d,#5a6268);">Clear All Jobs & Reset API</button>
+          <button type="button" id="forceClearBtn" style="background: linear-gradient(180deg,#dc3545,#a52929);">Force Clear All (Including Orphaned Tasks)</button>
         </div>
       </form>
     </div>
@@ -1217,6 +1258,7 @@ app.get('/scrape', (req, res) => {
       const rateInfo = document.getElementById('rateInfo');
       const cancelBtn = document.getElementById('cancelBtn');
       const clearAllBtn = document.getElementById('clearAllBtn');
+      const forceClearBtn = document.getElementById('forceClearBtn');
       const progressCard = document.getElementById('progressCard');
 
       // Calculate and display current rate
@@ -1279,6 +1321,29 @@ app.get('/scrape', (req, res) => {
             }
           } catch (error) {
             alert('Error clearing jobs: ' + error.message);
+          }
+        }
+      });
+
+      // Force clear all button functionality
+      forceClearBtn.addEventListener('click', async () => {
+        if (confirm('Are you sure you want to FORCE CLEAR ALL tasks including orphaned ones? This will aggressively stop ALL running processes and reset everything. Use this if regular clear doesn\'t work.')) {
+          try {
+            const response = await fetch('/scrape/force-clear', { method: 'POST' });
+            const result = await response.json();
+            if (result.ok) {
+              // Reset UI
+              cancelBtn.style.display = 'none';
+              fill.style.width = '0%';
+              meta.textContent = 'Force clear completed - all tasks stopped';
+              doneBox.style.display = 'none';
+              progressCard.style.display = 'none'; // Hide progress card
+              alert('Force clear completed! All tasks including orphaned ones have been stopped.');
+            } else {
+              alert('Failed to force clear: ' + result.error);
+            }
+          } catch (error) {
+            alert('Error force clearing: ' + error.message);
           }
         }
       });
@@ -1672,6 +1737,45 @@ app.post('/scrape/clear-all', (req, res) => {
   
   console.log('All jobs cleared, all requests aborted, rate limiter queue cleared, cache reset, and rate limiter reset');
   res.json({ ok: true, message: 'All jobs cleared, all requests aborted, rate limiter queue cleared, API cache reset, and rate limiter reset' });
+});
+
+// Force clear all orphaned tasks endpoint
+app.post('/scrape/force-clear', (req, res) => {
+  console.log('Force clearing all tasks including orphaned ones...');
+  
+  // Abort all running requests immediately
+  if (globalAbortController) {
+    globalAbortController.abort();
+    globalAbortController = null;
+  }
+  
+  // Clear all jobs
+  scrapeJobs.clear();
+  activeScrapeJob = null;
+  jobCancelled = true;
+  
+  // Force clear rate limiter queue multiple times to ensure it's empty
+  rateLimiter.clearQueue();
+  
+  // Reset all rate limiter state
+  rateLimiter.activeRequests = 0;
+  rateLimiter.requestQueue = [];
+  rateLimiter.requestTimes = [];
+  
+  // Reset circuit breaker
+  rateLimiter.circuitBreaker = {
+    failures: 0,
+    lastFailureTime: 0,
+    state: 'CLOSED',
+    threshold: 5,
+    timeout: 60000
+  };
+  
+  // Reset app start time to trigger orphaned task detection
+  appStartTime = Date.now();
+  
+  console.log('Force clear completed - all tasks and orphaned processes cleared');
+  res.json({ ok: true, message: 'Force clear completed - all tasks and orphaned processes cleared' });
 });
 
 app.get('/scrape/active', (req, res) => {
