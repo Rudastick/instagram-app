@@ -359,7 +359,7 @@ async function fetchProfile(username, retries = 3) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+      const url = `https://${RAPIDAPI_HOST}/profile2?username=${encodeURIComponent(username)}`;
       console.log(`Fetching profile for ${username} (attempt ${attempt}/${retries})`);
       
       const controller = new AbortController();
@@ -396,6 +396,11 @@ async function fetchProfile(username, retries = 3) {
         throw new Error(`Non-JSON: ${text.slice(0,120)}`);
       }
       
+      // Check if the response indicates success
+      if (json.status === false) {
+        throw new Error(json.errorMessage || 'API returned status: false');
+      }
+      
       const p = pickProfile(json);
       if (!p || typeof p !== 'object') {
         console.log(`No profile object for ${username}:`, json);
@@ -429,8 +434,8 @@ function mapToCsvRow(p, inputUsername) {
     p.timeline_media_count ?? null;
 
   const followers =
-    p.followers_count ??
     p.follower_count ??
+    p.followers_count ??
     p.edge_followed_by?.count ?? null;
 
   const following =
