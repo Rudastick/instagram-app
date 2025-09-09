@@ -1175,13 +1175,22 @@ app.get('/scrape', (req, res) => {
       }
 
       function showOptimalSettings(results) {
+        console.log('showOptimalSettings called with:', results);
         const best = results.best;
-        document.getElementById('optDelay').textContent = best.delay;
-        document.getElementById('optConc').textContent = best.concurrency;
-        document.getElementById('optSpeed').textContent = best.requestsPerSecond.toFixed(1);
-        document.getElementById('optSuccess').textContent = best.successRate.toFixed(1);
         
-        testStatus.textContent = 'Test completed! Found optimal settings for ' + best.requestsPerSecond.toFixed(1) + ' req/s';
+        if (!best) {
+          testStatus.textContent = 'Test completed but no optimal settings found. Try different settings manually.';
+          console.log('No best configuration found in results');
+          return;
+        }
+        
+        console.log('Best configuration:', best);
+        document.getElementById('optDelay').textContent = best.delay || 'N/A';
+        document.getElementById('optConc').textContent = best.concurrency || 'N/A';
+        document.getElementById('optSpeed').textContent = (best.requestsPerSecond || 0).toFixed(1);
+        document.getElementById('optSuccess').textContent = (best.successRate || 0).toFixed(1);
+        
+        testStatus.textContent = 'Test completed! Found optimal settings for ' + (best.requestsPerSecond || 0).toFixed(1) + ' req/s';
         optimalSettings.style.display = 'block';
       }
 
@@ -1479,9 +1488,12 @@ async function runPerformanceTests(testId, usernames) {
 
   // Find best configuration
   const validResults = testJob.results.filter(r => r.successRate > 0);
+  console.log(`Test run completed. Valid results: ${validResults.length}/${testJob.results.length}`);
+  
   if (validResults.length === 0) {
     testJob.status = 'error';
     testJob.error = 'All test configurations failed';
+    console.log('All test configurations failed');
     return;
   }
 
@@ -1493,8 +1505,11 @@ async function runPerformanceTests(testId, usernames) {
 
   scoredResults.sort((a, b) => b.score - a.score);
   testJob.best = scoredResults[0];
+  testJob.results.best = scoredResults[0]; // Also add to results for frontend
   testJob.status = 'completed';
   testJob.completed = testJob.totalTests;
+  
+  console.log('Best configuration found:', testJob.best);
 }
 
 async function testConfiguration(usernames, delay, concurrency) {
@@ -1504,6 +1519,7 @@ async function testConfiguration(usernames, delay, concurrency) {
   
   // Test with first 5 usernames
   const testUsernames = usernames.slice(0, 5);
+  console.log(`Testing config: delay=${delay}ms, concurrency=${concurrency}, usernames=${testUsernames.length}`);
   
   const processBatch = async (batch) => {
     const promises = batch.map(async (username) => {
@@ -1536,11 +1552,11 @@ async function testConfiguration(usernames, delay, concurrency) {
     await processBatch(batch);
   }
 
-  const duration = (Date.now() - startTime) / 1000;
+  const duration = Math.max((Date.now() - startTime) / 1000, 0.1); // Prevent division by zero
   const successful = results.filter(r => r.success).length;
-  const successRate = (successful / results.length) * 100;
+  const successRate = results.length > 0 ? (successful / results.length) * 100 : 0;
   const requestsPerSecond = results.length / duration;
-  const avgResponseTime = results.reduce((sum, r) => sum + r.responseTime, 0) / results.length;
+  const avgResponseTime = results.length > 0 ? results.reduce((sum, r) => sum + r.responseTime, 0) / results.length : 0;
 
   return {
     requestsPerSecond: Math.round(requestsPerSecond * 10) / 10,
