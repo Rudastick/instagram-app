@@ -69,6 +69,9 @@ app.use('/static', express.static(path.join(__dirname, 'static')));
 // Scrape jobs (in-memory per-process)
 const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc }
 
+// Test run jobs (in-memory per-process)
+const testJobs = new Map(); // testId -> { status, completed, totalTests, results, error }
+
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -999,8 +1002,29 @@ app.get('/scrape', (req, res) => {
           <div><label>Retry attempts</label><input type="number" name="retries" min="1" max="5" value="3" title="Number of retries for failed requests"/></div>
           <div><label>Cache duration (min)</label><input type="number" name="cache" min="1" max="60" value="5" title="How long to cache successful requests"/></div>
         </div>
-        <button type="submit">Start Scrape</button>
+        <div class="actions">
+          <button type="submit">Start Scrape</button>
+          <button type="button" id="testRunBtn" style="background: linear-gradient(180deg,#28a745,#1e7e34);">Test Run (Find Best Settings)</button>
+        </div>
       </form>
+    </div>
+
+    <div class="card" id="testResults" style="display:none;">
+      <label>Test Run Results</label>
+      <div id="testStatus" class="muted">Running tests...</div>
+      <div id="testProgress" style="height:8px;background:#0f172f;border:1px solid #223064;border-radius:4px;overflow:hidden;margin:8px 0;">
+        <div id="testFill" style="height:100%;width:0%;background:linear-gradient(90deg,#28a745,#1e7e34);"></div>
+      </div>
+      <div id="optimalSettings" style="display:none;">
+        <div class="notice" style="margin-top:10px;">
+          <h4>🎯 Recommended Settings:</h4>
+          <p><strong>Delay:</strong> <span id="optDelay">-</span>ms</p>
+          <p><strong>Concurrency:</strong> <span id="optConc">-</span></p>
+          <p><strong>Expected Speed:</strong> <span id="optSpeed">-</span> requests/second</p>
+          <p><strong>Success Rate:</strong> <span id="optSuccess">-</span>%</p>
+          <button type="button" onclick="applyOptimalSettings()" style="background: linear-gradient(180deg,#28a745,#1e7e34); margin-top:8px;">Apply These Settings</button>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -1020,6 +1044,11 @@ app.get('/scrape', (req, res) => {
       const meta = document.getElementById('meta');
       const doneBox = document.getElementById('doneBox');
       const dl = document.getElementById('dl');
+      const testRunBtn = document.getElementById('testRunBtn');
+      const testResults = document.getElementById('testResults');
+      const testStatus = document.getElementById('testStatus');
+      const testFill = document.getElementById('testFill');
+      const optimalSettings = document.getElementById('optimalSettings');
 
       form.addEventListener('submit', async (e)=>{
         e.preventDefault();
@@ -1068,6 +1097,104 @@ app.get('/scrape', (req, res) => {
           }
         }, 600);
       });
+
+      // Test Run functionality
+      testRunBtn.addEventListener('click', async (e) => {
+        e.preventDefault();
+        
+        const fileInput = form.querySelector('input[name="file"]');
+        if (!fileInput.files[0]) {
+          alert('Please upload a .txt file first');
+          return;
+        }
+
+        testResults.style.display = 'block';
+        testStatus.textContent = 'Starting test run...';
+        testFill.style.width = '0%';
+        optimalSettings.style.display = 'none';
+        testRunBtn.disabled = true;
+        testRunBtn.textContent = 'Testing...';
+
+        try {
+          const fd = new FormData();
+          fd.append('file', fileInput.files[0]);
+          fd.append('testMode', 'true');
+
+          const response = await fetch('/scrape/test-run', { 
+            method: 'POST', 
+            body: fd 
+          });
+          const result = await response.json();
+
+          if (!result.ok) {
+            throw new Error(result.error || 'Test run failed');
+          }
+
+          const testId = result.testId;
+          await runTest(testId);
+
+        } catch (error) {
+          testStatus.textContent = 'Test failed: ' + error.message;
+          testRunBtn.disabled = false;
+          testRunBtn.textContent = 'Test Run (Find Best Settings)';
+        }
+      });
+
+      async function runTest(testId) {
+        const testTimer = setInterval(async () => {
+          try {
+            const response = await fetch('/scrape/test-status?testId=' + encodeURIComponent(testId));
+            const status = await response.json();
+
+            if (!status.ok) {
+              throw new Error(status.error || 'Test status failed');
+            }
+
+            const progress = status.totalTests ? Math.round((status.completed / status.totalTests) * 100) : 0;
+            testFill.style.width = progress + '%';
+            testStatus.textContent = 'Testing configuration ' + status.completed + '/' + status.totalTests + ' (' + progress + '%)';
+
+            if (status.status === 'completed') {
+              clearInterval(testTimer);
+              showOptimalSettings(status.results);
+              testRunBtn.disabled = false;
+              testRunBtn.textContent = 'Test Run (Find Best Settings)';
+            } else if (status.status === 'error') {
+              clearInterval(testTimer);
+              testStatus.textContent = 'Test failed: ' + status.error;
+              testRunBtn.disabled = false;
+              testRunBtn.textContent = 'Test Run (Find Best Settings)';
+            }
+          } catch (error) {
+            clearInterval(testTimer);
+            testStatus.textContent = 'Test failed: ' + error.message;
+            testRunBtn.disabled = false;
+            testRunBtn.textContent = 'Test Run (Find Best Settings)';
+          }
+        }, 1000);
+      }
+
+      function showOptimalSettings(results) {
+        const best = results.best;
+        document.getElementById('optDelay').textContent = best.delay;
+        document.getElementById('optConc').textContent = best.concurrency;
+        document.getElementById('optSpeed').textContent = best.requestsPerSecond.toFixed(1);
+        document.getElementById('optSuccess').textContent = best.successRate.toFixed(1);
+        
+        testStatus.textContent = 'Test completed! Found optimal settings for ' + best.requestsPerSecond.toFixed(1) + ' req/s';
+        optimalSettings.style.display = 'block';
+      }
+
+      function applyOptimalSettings() {
+        const optDelay = document.getElementById('optDelay').textContent;
+        const optConc = document.getElementById('optConc').textContent;
+        
+        form.querySelector('input[name="delay"]').value = optDelay;
+        form.querySelector('input[name="conc"]').value = optConc;
+        
+        testResults.style.display = 'none';
+        alert('Optimal settings applied! You can now start the scrape.');
+      }
     </script>
     `,
     req
@@ -1252,6 +1379,177 @@ app.get('/scrape/download', (req, res) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.send(csv);
 });
+
+// ===== Test Run Endpoints =====
+app.post('/scrape/test-run', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) return res.json({ ok: false, error: 'No file uploaded' });
+
+    const content = req.file.buffer.toString('utf8');
+    const usernames = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+    if (!usernames.length) return res.json({ ok: false, error: 'Empty file' });
+
+    // Remove duplicates and take first 10 for testing
+    const uniqueUsernames = [...new Set(usernames.map(u => u.toLowerCase()))].slice(0, 10);
+    
+    const testId = crypto.randomBytes(8).toString('hex');
+    const testJob = {
+      status: 'running',
+      completed: 0,
+      totalTests: 0,
+      results: [],
+      error: null,
+      usernames: uniqueUsernames
+    };
+    testJobs.set(testId, testJob);
+
+    // Start test run in background
+    (async () => {
+      try {
+        await runPerformanceTests(testId, uniqueUsernames);
+      } catch (e) {
+        testJob.status = 'error';
+        testJob.error = e.message;
+        console.error('Test run failed:', e);
+      }
+    })();
+
+    res.json({ ok: true, testId });
+  } catch (e) {
+    res.json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/scrape/test-status', (req, res) => {
+  const testId = (req.query.testId || '').trim();
+  const testJob = testJobs.get(testId);
+  if (!testJob) return res.json({ ok: false, error: 'Test not found' });
+
+  res.json({
+    ok: true,
+    status: testJob.status,
+    completed: testJob.completed,
+    totalTests: testJob.totalTests,
+    results: testJob.results,
+    error: testJob.error
+  });
+});
+
+async function runPerformanceTests(testId, usernames) {
+  const testJob = testJobs.get(testId);
+  
+  // Test configurations: [delay, concurrency]
+  const testConfigs = [
+    [50, 1], [50, 2], [50, 4],
+    [100, 1], [100, 2], [100, 4], [100, 6],
+    [200, 1], [200, 2], [200, 4], [200, 6], [200, 8],
+    [500, 1], [500, 2], [500, 4], [500, 6], [500, 8]
+  ];
+
+  testJob.totalTests = testConfigs.length;
+  testJob.results = [];
+
+  for (let i = 0; i < testConfigs.length; i++) {
+    const [delay, concurrency] = testConfigs[i];
+    testJob.completed = i;
+    
+    try {
+      const result = await testConfiguration(usernames, delay, concurrency);
+      testJob.results.push({
+        delay,
+        concurrency,
+        ...result
+      });
+      
+      // Small delay between tests
+      await sleep(1000);
+    } catch (e) {
+      console.error(`Test config [${delay}ms, ${concurrency} workers] failed:`, e.message);
+      testJob.results.push({
+        delay,
+        concurrency,
+        requestsPerSecond: 0,
+        successRate: 0,
+        errorRate: 100,
+        avgResponseTime: 0,
+        errors: [e.message]
+      });
+    }
+  }
+
+  // Find best configuration
+  const validResults = testJob.results.filter(r => r.successRate > 0);
+  if (validResults.length === 0) {
+    testJob.status = 'error';
+    testJob.error = 'All test configurations failed';
+    return;
+  }
+
+  // Score based on success rate and speed
+  const scoredResults = validResults.map(r => ({
+    ...r,
+    score: (r.successRate / 100) * r.requestsPerSecond
+  }));
+
+  scoredResults.sort((a, b) => b.score - a.score);
+  testJob.best = scoredResults[0];
+  testJob.status = 'completed';
+  testJob.completed = testJob.totalTests;
+}
+
+async function testConfiguration(usernames, delay, concurrency) {
+  const startTime = Date.now();
+  const results = [];
+  const errors = [];
+  
+  // Test with first 5 usernames
+  const testUsernames = usernames.slice(0, 5);
+  
+  const processBatch = async (batch) => {
+    const promises = batch.map(async (username) => {
+      const requestStart = Date.now();
+      try {
+        const profile = await fetchProfile(username, 2); // Only 2 retries for testing
+        const responseTime = Date.now() - requestStart;
+        results.push({ username, success: true, responseTime });
+        return { success: true, responseTime };
+      } catch (e) {
+        const responseTime = Date.now() - requestStart;
+        errors.push(e.message);
+        results.push({ username, success: false, responseTime, error: e.message });
+        return { success: false, responseTime, error: e.message };
+      }
+    });
+    
+    await Promise.allSettled(promises);
+    
+    // Add delay between requests
+    if (delay > 0) {
+      await sleep(delay);
+    }
+  };
+
+  // Process in batches
+  const batchSize = Math.max(1, Math.floor(concurrency));
+  for (let i = 0; i < testUsernames.length; i += batchSize) {
+    const batch = testUsernames.slice(i, i + batchSize);
+    await processBatch(batch);
+  }
+
+  const duration = (Date.now() - startTime) / 1000;
+  const successful = results.filter(r => r.success).length;
+  const successRate = (successful / results.length) * 100;
+  const requestsPerSecond = results.length / duration;
+  const avgResponseTime = results.reduce((sum, r) => sum + r.responseTime, 0) / results.length;
+
+  return {
+    requestsPerSecond: Math.round(requestsPerSecond * 10) / 10,
+    successRate: Math.round(successRate * 10) / 10,
+    errorRate: Math.round((100 - successRate) * 10) / 10,
+    avgResponseTime: Math.round(avgResponseTime),
+    errors: [...new Set(errors)] // Unique errors
+  };
+}
 
 // ===== Revert last actions (per VA shows their own 10) =====
 app.get('/revert', async (req, res) => {
