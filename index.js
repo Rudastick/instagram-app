@@ -342,8 +342,8 @@ app.get('/scrape', (req, res) => {
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="135" title="Delay between requests"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="8" value="4" title="Number of concurrent requests"/></div>
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="50" title="Delay between requests"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="10" value="6" title="Number of concurrent requests"/></div>
         </div>
         <div class="actions">
           <button type="button" id="checkTasksBtn">Check Running Tasks</button>
@@ -459,29 +459,28 @@ app.get('/scrape', (req, res) => {
               fill.style.width = pct + '%';
               meta.textContent = pct + '% (' + s.done + '/' + s.total + ')';
 
-              // Calculate ETA
+              // Calculate ETA - improved logic
               const now = Date.now();
-              if (s.done > lastProgressDone && lastProgressTime) {
-                const timeDiff = now - lastProgressTime;
-                const progressDiff = s.done - lastProgressDone;
-                const rate = progressDiff / (timeDiff / 1000); // items per second
-                
-                if (rate > 0 && s.done < s.total) {
+              const elapsed = Math.floor((now - startTime) / 1000);
+              const elapsedMinutes = Math.floor(elapsed / 60);
+              const elapsedSeconds = elapsed % 60;
+              
+              // Always calculate ETA based on overall progress
+              if (s.done > 0 && s.done < s.total) {
+                const overallRate = s.done / elapsed; // items per second
+                if (overallRate > 0) {
                   const remaining = s.total - s.done;
-                  const etaSeconds = Math.round(remaining / rate);
+                  const etaSeconds = Math.round(remaining / overallRate);
                   const etaMinutes = Math.floor(etaSeconds / 60);
                   const etaSecs = etaSeconds % 60;
                   
-                  const elapsed = Math.floor((now - startTime) / 1000);
-                  const elapsedMinutes = Math.floor(elapsed / 60);
-                  const elapsedSeconds = elapsed % 60;
-                  
                   timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + 
                     ' | ETA: ' + etaMinutes.toString().padStart(2, '0') + ':' + etaSecs.toString().padStart(2, '0');
+                } else {
+                  timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + ' | ETA: --:--';
                 }
-                
-                lastProgressTime = now;
-                lastProgressDone = s.done;
+              } else if (s.done === 0) {
+                timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + ' | ETA: --:--';
               }
 
               // Update status message with detailed info
@@ -493,6 +492,13 @@ app.get('/scrape', (req, res) => {
                 if (s.successRate > 0) {
                   statusText += ' | Success rate: ' + s.successRate + '%';
                 }
+                
+                // Add processing rate
+                if (elapsed > 0) {
+                  const rate = (s.done / elapsed).toFixed(1);
+                  statusText += ' | Rate: ' + rate + '/sec';
+                }
+                
                 if (s.completedUsernames && s.completedUsernames.length > 0) {
                   statusText += ' | Recent: ' + s.completedUsernames.slice(-3).join(', ');
                 }
@@ -553,8 +559,8 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       });
     }
     
-    const delay = Math.max(0, parseInt(req.body.delay || '135', 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '4', 10), 8));
+    const delay = Math.max(0, parseInt(req.body.delay || '50', 10));
+    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '6', 10), 10));
 
     const content = req.file.buffer.toString('utf8');
     const usernames = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
@@ -615,11 +621,6 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
           
           currentScrapeJob.done++;
           currentScrapeJob.currentUsername = null;
-          
-          // Add delay between requests (only if delay > 0)
-          if (delay > 0) {
-            await new Promise(resolve => setTimeout(resolve, delay));
-          }
         };
 
         // Process usernames in batches with concurrency
@@ -632,6 +633,11 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
           );
           
           await Promise.all(promises);
+          
+          // Add delay between batches (not individual requests)
+          if (delay > 0 && i + conc < usernames.length) {
+            await new Promise(resolve => setTimeout(resolve, delay));
+          }
         }
         
         currentScrapeJob.status = 'done';
