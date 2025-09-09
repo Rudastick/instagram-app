@@ -72,6 +72,32 @@ const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, er
 // Test run jobs (in-memory per-process)
 const testJobs = new Map(); // testId -> { status, completed, totalTests, results, error }
 
+// Active job tracking (prevent multiple simultaneous jobs)
+let activeScrapeJob = null;
+let activeTestJob = null;
+
+// Clean up old jobs periodically
+setInterval(() => {
+  const now = Date.now();
+  const maxAge = 30 * 60 * 1000; // 30 minutes
+  
+  // Clean up old scrape jobs
+  for (const [jobId, job] of scrapeJobs.entries()) {
+    if (now - job.start > maxAge) {
+      scrapeJobs.delete(jobId);
+      if (activeScrapeJob === jobId) activeScrapeJob = null;
+    }
+  }
+  
+  // Clean up old test jobs
+  for (const [testId, job] of testJobs.entries()) {
+    if (now - job.start > maxAge) {
+      testJobs.delete(testId);
+      if (activeTestJob === testId) activeTestJob = null;
+    }
+  }
+}, 5 * 60 * 1000); // Check every 5 minutes
+
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
 
@@ -1048,6 +1074,7 @@ app.get('/scrape', (req, res) => {
         <div class="actions">
           <button type="submit">Start Scrape</button>
           <button type="button" id="testRunBtn" style="background: linear-gradient(180deg,#28a745,#1e7e34);">Test Run (Find Best Settings)</button>
+          <button type="button" id="cancelBtn" style="background: linear-gradient(180deg,#dc3545,#c82333); display:none;">Cancel Current Job</button>
         </div>
       </form>
     </div>
@@ -1093,6 +1120,7 @@ app.get('/scrape', (req, res) => {
       const testFill = document.getElementById('testFill');
       const optimalSettings = document.getElementById('optimalSettings');
       const rateInfo = document.getElementById('rateInfo');
+      const cancelBtn = document.getElementById('cancelBtn');
 
       // Calculate and display current rate
       function updateRateInfo() {
@@ -1114,11 +1142,46 @@ app.get('/scrape', (req, res) => {
       form.querySelector('input[name="conc"]').addEventListener('input', updateRateInfo);
       updateRateInfo(); // Initial calculation
 
+      // Cancel button functionality
+      cancelBtn.addEventListener('click', async () => {
+        if (confirm('Are you sure you want to cancel the current scraping job?')) {
+          try {
+            const response = await fetch('/scrape/cancel', { method: 'POST' });
+            const result = await response.json();
+            if (result.ok) {
+              cancelBtn.style.display = 'none';
+              alert('Job cancelled successfully');
+            } else {
+              alert('Failed to cancel job: ' + result.error);
+            }
+          } catch (error) {
+            alert('Error cancelling job: ' + error.message);
+          }
+        }
+      });
+
+      // Check for active jobs on page load
+      async function checkActiveJobs() {
+        try {
+          const response = await fetch('/scrape/active');
+          const result = await response.json();
+          if (result.ok && result.active) {
+            cancelBtn.style.display = 'inline-block';
+            meta.textContent = 'Active job: ' + result.progress + ' (' + result.percentage + '%)';
+            fill.style.width = result.percentage + '%';
+          }
+        } catch (error) {
+          console.log('Could not check active jobs:', error.message);
+        }
+      }
+      checkActiveJobs();
+
       form.addEventListener('submit', async (e)=>{
         e.preventDefault();
         doneBox.style.display = 'none';
         fill.style.width = '0%';
         meta.textContent = '0%';
+        cancelBtn.style.display = 'inline-block'; // Show cancel button when starting
 
         const fd = new FormData(form);
         const r = await fetch('/scrape/start', { method:'POST', body: fd });
@@ -1154,10 +1217,12 @@ app.get('/scrape', (req, res) => {
             meta.textContent = finalText;
             dl.href = '/scrape/download?job='+encodeURIComponent(job);
             doneBox.style.display = 'block';
+            cancelBtn.style.display = 'none'; // Hide cancel button when done
           }
           if(s.status==='error'){
             clearInterval(timer);
             alert('Scrape failed: '+s.error);
+            cancelBtn.style.display = 'none'; // Hide cancel button on error
           }
         }, 600);
       });
@@ -1282,7 +1347,18 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
     
-    const delay = Math.max(0, parseInt(req.body.delay || '100', 10));
+    // Check if there's already an active scraping job
+    if (activeScrapeJob) {
+      const existingJob = scrapeJobs.get(activeScrapeJob);
+      if (existingJob && existingJob.status === 'running') {
+        return res.json({ 
+          ok: false, 
+          error: `Another scraping job is already running (${existingJob.done}/${existingJob.total} completed). Please wait for it to finish or refresh the page to cancel it.` 
+        });
+      }
+    }
+    
+    const delay = Math.max(0, parseInt(req.body.delay || '200', 10));
     const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 8));
     const retries = Math.max(1, Math.min(parseInt(req.body.retries || '3', 10), 5));
     const cacheMinutes = Math.max(1, Math.min(parseInt(req.body.cache || '5', 10), 60));
@@ -1317,6 +1393,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       cacheHits: 0
     };
     scrapeJobs.set(jobId, job);
+    activeScrapeJob = jobId; // Mark as active
 
     // background worker with improved concurrency
     (async () => {
@@ -1385,6 +1462,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
         // Filter out undefined results and assign to job.rows
         job.rows = results.filter(row => row !== undefined);
         job.status = 'done';
+        activeScrapeJob = null; // Mark as completed
         
         // Log performance statistics
         const duration = (Date.now() - job.start) / 1000;
@@ -1405,6 +1483,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       } catch (e) {
         job.status = 'error';
         job.error = e.message;
+        activeScrapeJob = null; // Mark as completed even on error
         console.error('Scraping job failed:', e);
       }
     })();
@@ -1454,6 +1533,45 @@ app.get('/scrape/download', (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="profiles_${Date.now()}.csv"`);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.send(csv);
+});
+
+// ===== Job Management =====
+app.post('/scrape/cancel', (req, res) => {
+  if (activeScrapeJob) {
+    const job = scrapeJobs.get(activeScrapeJob);
+    if (job && job.status === 'running') {
+      job.status = 'cancelled';
+      job.error = 'Cancelled by user';
+      activeScrapeJob = null;
+      console.log('Scraping job cancelled by user');
+      res.json({ ok: true, message: 'Job cancelled' });
+    } else {
+      res.json({ ok: false, error: 'No active job to cancel' });
+    }
+  } else {
+    res.json({ ok: false, error: 'No active job to cancel' });
+  }
+});
+
+app.get('/scrape/active', (req, res) => {
+  if (activeScrapeJob) {
+    const job = scrapeJobs.get(activeScrapeJob);
+    if (job) {
+      res.json({ 
+        ok: true, 
+        active: true, 
+        jobId: activeScrapeJob,
+        status: job.status,
+        progress: `${job.done}/${job.total}`,
+        percentage: job.total ? Math.round((job.done / job.total) * 100) : 0
+      });
+    } else {
+      activeScrapeJob = null;
+      res.json({ ok: true, active: false });
+    }
+  } else {
+    res.json({ ok: true, active: false });
+  }
 });
 
 // ===== Test Run Endpoints =====
