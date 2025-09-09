@@ -995,12 +995,16 @@ app.get('/scrape', (req, res) => {
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="100" title="Lower delay = faster but may hit rate limits"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="8" value="${SCRAPE_CONCURRENCY}" title="Higher concurrency = faster but more resource intensive"/></div>
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="200" title="Lower delay = faster but may hit rate limits (30 req/s max)"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="6" value="3" title="Higher concurrency = faster but more resource intensive"/></div>
         </div>
         <div class="row">
           <div><label>Retry attempts</label><input type="number" name="retries" min="1" max="5" value="3" title="Number of retries for failed requests"/></div>
           <div><label>Cache duration (min)</label><input type="number" name="cache" min="1" max="60" value="5" title="How long to cache successful requests"/></div>
+        </div>
+        <div class="notice" style="margin-top:10px;">
+          <strong>Rate Limit Info:</strong> Your plan allows 30 requests/second. 
+          <span id="rateInfo">Current settings: ~15 req/s</span>
         </div>
         <div class="actions">
           <button type="submit">Start Scrape</button>
@@ -1049,6 +1053,27 @@ app.get('/scrape', (req, res) => {
       const testStatus = document.getElementById('testStatus');
       const testFill = document.getElementById('testFill');
       const optimalSettings = document.getElementById('optimalSettings');
+      const rateInfo = document.getElementById('rateInfo');
+
+      // Calculate and display current rate
+      function updateRateInfo() {
+        const delay = parseInt(form.querySelector('input[name="delay"]').value || '200', 10);
+        const conc = parseInt(form.querySelector('input[name="conc"]').value || '3', 10);
+        
+        // Calculate theoretical max rate: 1000ms / delay * concurrency
+        const maxRate = Math.round((1000 / delay) * conc * 10) / 10;
+        const rateText = maxRate > 30 ? 
+          'WARNING: ' + maxRate + ' req/s (EXCEEDS 30 req/s limit!)' : 
+          'OK: ' + maxRate + ' req/s (within limit)';
+        
+        rateInfo.textContent = 'Current settings: ' + rateText;
+        rateInfo.style.color = maxRate > 30 ? '#ff6b6b' : '#51cf66';
+      }
+
+      // Update rate info when settings change
+      form.querySelector('input[name="delay"]').addEventListener('input', updateRateInfo);
+      form.querySelector('input[name="conc"]').addEventListener('input', updateRateInfo);
+      updateRateInfo(); // Initial calculation
 
       form.addEventListener('submit', async (e)=>{
         e.preventDefault();
@@ -1200,6 +1225,9 @@ app.get('/scrape', (req, res) => {
         
         form.querySelector('input[name="delay"]').value = optDelay;
         form.querySelector('input[name="conc"]').value = optConc;
+        
+        // Update rate info display
+        updateRateInfo();
         
         testResults.style.display = 'none';
         alert('Optimal settings applied! You can now start the scrape.');
@@ -1447,12 +1475,14 @@ app.get('/scrape/test-status', (req, res) => {
 async function runPerformanceTests(testId, usernames) {
   const testJob = testJobs.get(testId);
   
-  // Test configurations: [delay, concurrency]
+  // Test configurations optimized for 30 req/s rate limit: [delay, concurrency]
   const testConfigs = [
-    [50, 1], [50, 2], [50, 4],
-    [100, 1], [100, 2], [100, 4], [100, 6],
-    [200, 1], [200, 2], [200, 4], [200, 6], [200, 8],
-    [500, 1], [500, 2], [500, 4], [500, 6], [500, 8]
+    // Conservative settings (well under rate limit)
+    [100, 1], [100, 2], [100, 3],
+    [150, 1], [150, 2], [150, 3], [150, 4],
+    [200, 1], [200, 2], [200, 3], [200, 4], [200, 5],
+    [300, 1], [300, 2], [300, 3], [300, 4], [300, 5], [300, 6],
+    [500, 1], [500, 2], [500, 3], [500, 4], [500, 5], [500, 6]
   ];
 
   testJob.totalTests = testConfigs.length;
