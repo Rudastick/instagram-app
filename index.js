@@ -220,6 +220,7 @@ function renderPage(title, content, req) {
     } else if (isManagement(req)) {
       nav = `<nav>
         <a href="/add">Import</a>
+        <a href="/format">Format & Take</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/mass-follow-formatter">Mass follow formatter</a>
@@ -229,6 +230,7 @@ function renderPage(title, content, req) {
     } else if (isAdmin(req)) {
       nav = `<nav>
         <a href="/add">Import</a>
+        <a href="/format">Format & Take</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin</a>
@@ -720,6 +722,7 @@ app.get('/add', (req, res) => {
         <button type="submit">Import Usernames</button>
       </form>
       <div class="actions">
+        <a href="/format">Format & Take</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin panel</a>
@@ -771,7 +774,7 @@ app.post('/add', upload.single('file'), async (req, res) => {
       <p>Detected ${duplicates} duplicates.</p>
     </div>
     <p><a href="/add">Back to Import</a></p>
-    `,
+    <p><a href="/format">Go to Format & Take Usernames</a></p>`,
     req
   );
   res.send(html);
@@ -847,7 +850,150 @@ app.get('/mass-follow-formatter', (req, res) => {
 });
 
 
-// IG format helpers removed — handled by extension
+// ===== Format & Take =====
+async function fetchInventoryCounts(model) {
+  const total = await Username.countDocuments({});
+  const unusedForModel = await Username.countDocuments({ used_by: { $ne: model } });
+  return { total, unusedForModel };
+}
+async function takeUsernames(model, takeCount) {
+  const docs = await Username.find({ used_by: { $ne: model } })
+    .sort({ date_added: -1 })
+    .limit(takeCount)
+    .lean();
+  const ids = docs.map(d => d._id);
+  if (ids.length) {
+    await Username.updateMany(
+      { _id: { $in: ids } },
+      { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } }
+    );
+  }
+  return { usernames: docs.map(d => d.username), ids };
+}
+
+app.get('/format', async (req, res) => {
+  const models = await Model.find({}).sort({ name: 1 }).lean();
+  const options = models.length
+    ? models.map(m => `<option value="${m.name}">${m.name}</option>`).join('')
+    : `<option value="Natalie">Natalie</option>`;
+
+  const html = renderPage(
+    'Format & Take Usernames',
+    `
+    <div class="card">
+      <form action="/format" method="post" id="formatForm">
+        <div class="row">
+          <div>
+            <label>Select model:</label>
+            <select name="model" id="modelSelect" required>${options}</select>
+            <div class="muted" id="invInfo" style="margin-top:6px;">Total: — | Unused: —</div>
+          </div>
+          <div>
+            <label>Number of accounts performing the follow task (A)</label>
+            <input type="number" name="count" min="1" value="10" required />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Number of usernames per line</label>
+            <input type="number" name="perLine" min="1" value="10" required />
+          </div>
+          <div>
+            <label>Total = A × B</label>
+            <input type="text" id="calcBox" value="Calculated after submit" disabled />
+          </div>
+        </div>
+        <button type="submit">Format and Preview</button>
+      </form>
+      <div class="muted">Select model to see inventory counters instantly.</div>
+    </div>
+    <script>
+      const sel = document.getElementById('modelSelect');
+      const info = document.getElementById('invInfo');
+      const form = document.getElementById('formatForm');
+      const a = form.querySelector('input[name="count"]');
+      const b = form.querySelector('input[name="perLine"]');
+      const calc = document.getElementById('calcBox');
+      function updateCalc(){ const A=parseInt(a.value||'0',10), B=parseInt(b.value||'0',10); if(A>0&&B>0) calc.value = (A*B)+' usernames'; }
+      a.addEventListener('input', updateCalc); b.addEventListener('input', updateCalc);
+      async function updateInv(){
+        const m = sel.value;
+        if(!m) return;
+        const r = await fetch('/inventory/'+encodeURIComponent(m));
+        const d = await r.json();
+        info.textContent = 'Total: '+d.total+' | Unused: '+d.unusedForModel;
+      }
+      sel.addEventListener('change', updateInv);
+      updateInv();
+    </script>`,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/format', async (req, res) => {
+  const count = parseInt(req.body.count, 10);
+  const perLine = parseInt(req.body.perLine, 10);
+  const model = (req.body.model || 'Natalie').trim();
+  if (!count || !perLine || count < 1 || perLine < 1) return res.status(400).send('Invalid form values');
+
+  const totalToFetch = count * perLine;
+  const { usernames, ids } = await takeUsernames(model, totalToFetch);
+
+  // group into B per line
+  const lines = [];
+  for (let i = 0; i < usernames.length; i += perLine) {
+    lines.push(usernames.slice(i, i + perLine).join(','));
+  }
+  const formatted = lines.join('\n');
+
+  // activity
+  const act = await Activity.create({
+    model,
+    va: req.session?.vaName || null,
+    accounts: count,
+    per_line: perLine,
+    total_usernames: usernames.length,
+    username_ids: ids,
+  });
+
+  await logEvent({
+    action: 'format_take',
+    details: { model, requested_accounts: count, per_line: perLine, total_requested: totalToFetch, total_returned: usernames.length, activity_id: String(act._id) },
+    req,
+    actor_type: req.session?.vaName ? 'va' : 'user',
+  });
+
+  const inv = await fetchInventoryCounts(model);
+
+  const html = renderPage(
+    'Formatted Usernames',
+    `
+    <div class="notice">
+      <p>Model: <b>${model}</b></p>
+      <p>A=${count} • B=${perLine} ⇒ Requested: ${totalToFetch}, Returned: ${usernames.length}</p>
+      <div class="kpi-pill">Total in DB: ${inv.total}</div>
+      <div class="kpi-pill">Unused for ${model}: ${inv.unusedForModel}</div>
+    </div>
+
+    <label>Preview:</label>
+    <textarea id="formattedBox" readonly>${formatted}</textarea>
+    <div class="actions">
+      <button type="button" onclick="copyFrom('formattedBox')">Copy to clipboard</button>
+      <form action="/download" method="post">
+        <input type="hidden" name="data" value="${encodeURIComponent(formatted)}" />
+        <input type="hidden" name="filename" value="usernames_${model}.txt" />
+        <button type="submit">Download .txt</button>
+      </form>
+    </div>
+
+    <div class="muted" style="margin-top:10px;">Activity saved. You can revert it from the <a href="/revert">Revert</a> page.</div>
+
+    <p style="margin-top:14px;"><a href="/format">Back to Format & Take</a></p>`,
+    req
+  );
+  res.send(html);
+});
 
 // X Format & Take helpers
 async function fetchXInventoryCounts(model) {
