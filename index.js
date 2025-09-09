@@ -359,7 +359,8 @@ app.get('/scrape', (req, res) => {
         <div id="fill" style="height:100%;width:0%;background:linear-gradient(90deg,#6a0dad,#52118e);"></div>
       </div>
       <div class="muted" id="meta" style="margin-top:8px;">0%</div>
-      <div id="timeDisplay" style="margin-top:8px; font-weight:bold; color:#6a0dad;">Time: 00:00</div>
+      <div id="timeDisplay" style="margin-top:8px; font-weight:bold; color:#6a0dad;">Elapsed: 00:00 | ETA: --:--</div>
+      <div id="statusDisplay" style="margin-top:8px; font-size:13px; color:#9ec1ff; word-wrap:break-word; line-height:1.4;">Ready to start...</div>
       <div id="doneBox" style="display:none;margin-top:10px;">
         <a id="dl" href="#" class="muted">Download CSV</a>
       </div>
@@ -371,6 +372,7 @@ app.get('/scrape', (req, res) => {
         const fill = document.getElementById('fill');
         const meta = document.getElementById('meta');
         const timeDisplay = document.getElementById('timeDisplay');
+        const statusDisplay = document.getElementById('statusDisplay');
         const doneBox = document.getElementById('doneBox');
         const dl = document.getElementById('dl');
         const startScrapeBtn = document.getElementById('startScrapeBtn');
@@ -380,6 +382,8 @@ app.get('/scrape', (req, res) => {
 
         let startTime = null;
         let timeInterval = null;
+        let lastProgressTime = null;
+        let lastProgressDone = 0;
 
         // Check for running tasks on page load
         checkTasksBtn.addEventListener('click', async () => {
@@ -422,14 +426,17 @@ app.get('/scrape', (req, res) => {
           doneBox.style.display = 'none';
           fill.style.width = '0%';
           meta.textContent = '0%';
+          statusDisplay.textContent = 'Starting scrape...';
           startTime = Date.now();
+          lastProgressTime = startTime;
+          lastProgressDone = 0;
           
           // Start time display
           timeInterval = setInterval(() => {
             const elapsed = Math.floor((Date.now() - startTime) / 1000);
             const minutes = Math.floor(elapsed / 60);
             const seconds = elapsed % 60;
-            timeDisplay.textContent = 'Time: ' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0');
+            timeDisplay.textContent = 'Elapsed: ' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0') + ' | ETA: --:--';
           }, 1000);
 
           const fd = new FormData(form);
@@ -452,17 +459,70 @@ app.get('/scrape', (req, res) => {
               fill.style.width = pct + '%';
               meta.textContent = pct + '% (' + s.done + '/' + s.total + ')';
 
+              // Calculate ETA
+              const now = Date.now();
+              if (s.done > lastProgressDone && lastProgressTime) {
+                const timeDiff = now - lastProgressTime;
+                const progressDiff = s.done - lastProgressDone;
+                const rate = progressDiff / (timeDiff / 1000); // items per second
+                
+                if (rate > 0 && s.done < s.total) {
+                  const remaining = s.total - s.done;
+                  const etaSeconds = Math.round(remaining / rate);
+                  const etaMinutes = Math.floor(etaSeconds / 60);
+                  const etaSecs = etaSeconds % 60;
+                  
+                  const elapsed = Math.floor((now - startTime) / 1000);
+                  const elapsedMinutes = Math.floor(elapsed / 60);
+                  const elapsedSeconds = elapsed % 60;
+                  
+                  timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + 
+                    ' | ETA: ' + etaMinutes.toString().padStart(2, '0') + ':' + etaSecs.toString().padStart(2, '0');
+                }
+                
+                lastProgressTime = now;
+                lastProgressDone = s.done;
+              }
+
+              // Update status message with detailed info
+              if (s.done < s.total) {
+                let statusText = 'Processing usernames... (' + s.done + '/' + s.total + ' completed)';
+                if (s.currentUsername) {
+                  statusText += ' | Currently: @' + s.currentUsername;
+                }
+                if (s.successRate > 0) {
+                  statusText += ' | Success rate: ' + s.successRate + '%';
+                }
+                if (s.completedUsernames && s.completedUsernames.length > 0) {
+                  statusText += ' | Recent: ' + s.completedUsernames.slice(-3).join(', ');
+                }
+                statusDisplay.textContent = statusText;
+              }
+
               if (s.status === 'done') {
                 clearInterval(timer);
                 clearInterval(timeInterval);
                 fill.style.width = '100%';
                 meta.textContent = '100% Completed';
+                
+                const totalTime = Math.floor((Date.now() - startTime) / 1000);
+                const minutes = Math.floor(totalTime / 60);
+                const seconds = totalTime % 60;
+                const successCount = s.completedUsernames ? s.completedUsernames.length : 0;
+                const failedCount = s.failedUsernames ? s.failedUsernames.length : 0;
+                
+                statusDisplay.textContent = 'Scraping completed! Total time: ' + 
+                  minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0') + 
+                  ' | Success: ' + successCount + ' | Failed: ' + failedCount + 
+                  ' | Success rate: ' + s.successRate + '%';
+                
                 dl.href = '/scrape/download?job=' + encodeURIComponent(jobId);
                 doneBox.style.display = 'block';
               }
               if (s.status === 'error') {
                 clearInterval(timer);
                 clearInterval(timeInterval);
+                statusDisplay.textContent = 'Scraping failed: ' + s.error;
                 alert('Scrape failed: ' + s.error);
                 progressCard.style.display = 'none';
               }
@@ -510,29 +570,36 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       status: 'running',
       error: null,
       delay,
-      conc
+      conc,
+      currentUsername: null,
+      completedUsernames: [],
+      failedUsernames: []
     };
     scrapeStartTime = Date.now();
 
-    // Background processing
+    // Background processing with concurrency
     (async () => {
       try {
-        for (let i = 0; i < usernames.length; i++) {
-          if (currentScrapeJob.status !== 'running') break;
+        const processUsername = async (username, index) => {
+          if (currentScrapeJob.status !== 'running') return;
           
-          const username = usernames[i];
+          currentScrapeJob.currentUsername = username;
+          
           try {
             const profile = await fetchProfile(username);
-            currentScrapeJob.rows.push({
+            const row = {
               'Username': username,
               'Name': profile.full_name || profile.name || '',
               'Followers': profile.followers_count || profile.follower_count || 0,
               'Following': profile.following_count || 0,
               'Media Count': profile.media_count || 0,
               'Private': profile.is_private ? 'TRUE' : 'FALSE'
-            });
+            };
+            
+            currentScrapeJob.rows[index] = row;
+            currentScrapeJob.completedUsernames.push(username);
           } catch (error) {
-            currentScrapeJob.rows.push({
+            const row = {
               'Username': username,
               'Name': '',
               'Followers': 0,
@@ -540,15 +607,31 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
               'Media Count': 0,
               'Private': 'FALSE',
               'Error': error.message
-            });
+            };
+            
+            currentScrapeJob.rows[index] = row;
+            currentScrapeJob.failedUsernames.push(username);
           }
           
           currentScrapeJob.done++;
+          currentScrapeJob.currentUsername = null;
           
-          // Add delay between requests
-          if (i < usernames.length - 1 && delay > 0) {
+          // Add delay between requests (only if delay > 0)
+          if (delay > 0) {
             await new Promise(resolve => setTimeout(resolve, delay));
           }
+        };
+
+        // Process usernames in batches with concurrency
+        for (let i = 0; i < usernames.length; i += conc) {
+          if (currentScrapeJob.status !== 'running') break;
+          
+          const batch = usernames.slice(i, i + conc);
+          const promises = batch.map((username, batchIndex) => 
+            processUsername(username, i + batchIndex)
+          );
+          
+          await Promise.all(promises);
         }
         
         currentScrapeJob.status = 'done';
@@ -575,7 +658,11 @@ app.get('/scrape/status', (req, res) => {
     status: currentScrapeJob.status,
     done: currentScrapeJob.done,
     total: currentScrapeJob.total,
-    error: currentScrapeJob.error
+    error: currentScrapeJob.error,
+    currentUsername: currentScrapeJob.currentUsername,
+    completedUsernames: currentScrapeJob.completedUsernames.slice(-5), // Last 5 completed
+    failedUsernames: currentScrapeJob.failedUsernames.slice(-5), // Last 5 failed
+    successRate: currentScrapeJob.done > 0 ? Math.round((currentScrapeJob.completedUsernames.length / currentScrapeJob.done) * 100) : 0
   });
 });
 
