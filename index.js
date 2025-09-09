@@ -32,8 +32,6 @@ const {
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi.com';
-const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || '1', 10);
-const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '200', 10);
 
 const IS_PROD = NODE_ENV === 'production';
 
@@ -68,7 +66,36 @@ app.use(
 app.use('/static', express.static(path.join(__dirname, 'static')));
 
 // Scrape jobs (in-memory per-process)
-const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc }
+const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc, stats, stopped }
+global.activeScrapeJob = null; // Only one active job at a time
+
+// Performance monitoring
+const performanceStats = {
+  totalRequests: 0,
+  successfulRequests: 0,
+  failedRequests: 0,
+  cacheHits: 0,
+  duplicatesRemoved: 0,
+  startTime: null,
+  lastRequestTime: null
+};
+
+// Request cache with TTL
+const requestCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Cache cleanup function
+function cleanupCache() {
+  const now = Date.now();
+  for (const [key, value] of requestCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      requestCache.delete(key);
+    }
+  }
+}
+
+// Run cache cleanup every minute
+setInterval(cleanupCache, 60000);
 
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -326,22 +353,76 @@ function pickProfile(payload) {
   return payload;
 }
 
-async function fetchProfile(username) {
-  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
-  const res = await fetch(url, {
-    headers: {
-      'x-rapidapi-host': RAPIDAPI_HOST,
-      'x-rapidapi-key': RAPIDAPI_KEY
-    }
-  });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch (e) {
-    throw new Error(`Non-JSON: ${text.slice(0,120)}`);
+async function fetchProfile(username, retries = 3) {
+  // Check cache first
+  const cacheKey = username.toLowerCase();
+  const cached = requestCache.get(cacheKey);
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
+    performanceStats.cacheHits++;
+    return cached.data;
   }
-  const p = pickProfile(json);
-  if (!p || typeof p !== 'object') throw new Error('No profile object');
-  return p;
+
+  performanceStats.totalRequests++;
+  performanceStats.lastRequestTime = Date.now();
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+      
+      const res = await fetch(url, {
+        headers: {
+          'x-rapidapi-host': RAPIDAPI_HOST,
+          'x-rapidapi-key': RAPIDAPI_KEY
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!res.ok) {
+        if (res.status === 429) { // Rate limited
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+          await sleep(delay);
+          continue;
+        }
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+
+      const text = await res.text();
+      let json;
+      try { 
+        json = JSON.parse(text); 
+      } catch (e) {
+        throw new Error(`Non-JSON: ${text.slice(0,120)}`);
+      }
+      
+      const p = pickProfile(json);
+      if (!p || typeof p !== 'object') {
+        throw new Error('No profile object');
+      }
+
+      // Cache successful result
+      requestCache.set(cacheKey, {
+        data: p,
+        timestamp: Date.now()
+      });
+
+      performanceStats.successfulRequests++;
+      return p;
+      
+    } catch (error) {
+      if (attempt === retries) {
+        performanceStats.failedRequests++;
+        throw error;
+      }
+      
+      // Exponential backoff with jitter
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+      await sleep(delay);
+    }
+  }
 }
 
 // Map API → Airtable-style CSV (Username first)
@@ -386,21 +467,39 @@ app.get('/scrape', (req, res) => {
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="${SCRAPE_DELAY_MS}"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="5" value="${SCRAPE_CONCURRENCY}"/></div>
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="100"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="8" value="4"/></div>
         </div>
-        <button type="submit">Start Scrape</button>
+        <div class="row">
+          <div><label>Retry attempts</label><input type="number" name="retries" min="1" max="5" value="3"/></div>
+          <div><label>Cache duration (min)</label><input type="number" name="cacheDuration" min="1" max="60" value="5"/></div>
+        </div>
+        <button type="submit" id="startBtn">Start Scrape</button>
+        <button type="button" id="stopBtn" style="display:none;background:linear-gradient(180deg,#d64b4b,#a52929);">Stop Scraping</button>
       </form>
     </div>
 
     <div class="card">
-      <label>Progress</label>
+      <label>Progress & Performance</label>
       <div id="bar" style="height:16px;background:#0f172f;border:1px solid #223064;border-radius:8px;overflow:hidden;">
         <div id="fill" style="height:100%;width:0%;background:linear-gradient(90deg,#6a0dad,#52118e);"></div>
       </div>
       <div class="muted" id="meta" style="margin-top:8px;">0%</div>
+      
+      <div id="stats" style="margin-top:12px;display:none;">
+        <div class="grid-3" style="font-size:12px;">
+          <div class="kpi-pill">✓ <span id="successCount">0</span> Success</div>
+          <div class="kpi-pill">✗ <span id="errorCount">0</span> Errors</div>
+          <div class="kpi-pill">🚀 <span id="cacheHits">0</span> Cache Hits</div>
+          <div class="kpi-pill">📊 <span id="requestRate">0</span> req/s</div>
+          <div class="kpi-pill">🔄 <span id="duplicatesRemoved">0</span> Duplicates</div>
+          <div class="kpi-pill">⏱️ <span id="elapsedTime">0s</span> Elapsed</div>
+        </div>
+      </div>
+      
       <div id="doneBox" style="display:none;margin-top:10px;">
         <a id="dl" href="#" class="muted">Download CSV</a>
+        <button type="button" id="downloadPartial" style="display:none;margin-left:10px;">Download Partial CSV</button>
       </div>
     </div>
 
@@ -410,40 +509,110 @@ app.get('/scrape', (req, res) => {
       const meta = document.getElementById('meta');
       const doneBox = document.getElementById('doneBox');
       const dl = document.getElementById('dl');
+      const startBtn = document.getElementById('startBtn');
+      const stopBtn = document.getElementById('stopBtn');
+      const stats = document.getElementById('stats');
+      const downloadPartial = document.getElementById('downloadPartial');
+      let currentJobId = null;
+      let progressTimer = null;
+
+      function updateStats(data) {
+        document.getElementById('successCount').textContent = data.successfulRequests || 0;
+        document.getElementById('errorCount').textContent = data.failedRequests || 0;
+        document.getElementById('cacheHits').textContent = data.cacheHits || 0;
+        document.getElementById('duplicatesRemoved').textContent = data.duplicatesRemoved || 0;
+        
+        const elapsed = data.elapsedTime || 0;
+        const rate = elapsed > 0 ? (data.totalRequests / elapsed).toFixed(1) : 0;
+        document.getElementById('requestRate').textContent = rate;
+        document.getElementById('elapsedTime').textContent = Math.round(elapsed) + 's';
+      }
+
+      function startProgress() {
+        stats.style.display = 'block';
+        startBtn.style.display = 'none';
+        stopBtn.style.display = 'inline-block';
+        fill.style.width = '0%';
+        meta.textContent = '0%';
+        doneBox.style.display = 'none';
+      }
+
+      function stopProgress() {
+        if (progressTimer) {
+          clearInterval(progressTimer);
+          progressTimer = null;
+        }
+        startBtn.style.display = 'inline-block';
+        stopBtn.style.display = 'none';
+        currentJobId = null;
+      }
 
       form.addEventListener('submit', async (e)=>{
         e.preventDefault();
-        doneBox.style.display = 'none';
-        fill.style.width = '0%';
-        meta.textContent = '0%';
+        
+        // Check if there's already an active job
+        const activeCheck = await fetch('/scrape/active').then(r=>r.json()).catch(()=>({active:false}));
+        if (activeCheck.active) {
+          alert('A scraping task is already running. Please wait for it to complete or stop it first.');
+          return;
+        }
+
+        startProgress();
 
         const fd = new FormData(form);
         const r = await fetch('/scrape/start', { method:'POST', body: fd });
         const j = await r.json();
-        if(!j.ok){ alert('Error: '+(j.error||'unknown')); return; }
+        if(!j.ok){ 
+          alert('Error: '+(j.error||'unknown')); 
+          stopProgress();
+          return; 
+        }
 
-        const job = j.jobId;
+        currentJobId = j.jobId;
 
-        const timer = setInterval(async ()=>{
-          const s = await fetch('/scrape/status?job='+encodeURIComponent(job)).then(r=>r.json()).catch(()=>null);
+        progressTimer = setInterval(async ()=>{
+          const s = await fetch('/scrape/status?job='+encodeURIComponent(currentJobId)).then(r=>r.json()).catch(()=>null);
           if(!s) return;
+          
           const pct = s.total ? Math.round((s.done/s.total)*100) : 0;
           fill.style.width = pct+'%';
           const eta = s.eta_s != null ? s.eta_s : 0;
           meta.textContent = pct+'%  '+s.done+'/'+s.total+'  ETA '+(eta>60?Math.round(eta/60)+'m':Math.round(eta)+'s');
+          
+          // Update performance stats
+          if (s.stats) {
+            updateStats(s.stats);
+          }
 
           if(s.status==='done'){
-            clearInterval(timer);
+            stopProgress();
             fill.style.width = '100%';
             meta.textContent = '100%  '+s.done+'/'+s.total+'  Completed';
-            dl.href = '/scrape/download?job='+encodeURIComponent(job);
+            dl.href = '/scrape/download?job='+encodeURIComponent(currentJobId);
             doneBox.style.display = 'block';
           }
           if(s.status==='error'){
-            clearInterval(timer);
+            stopProgress();
             alert('Scrape failed: '+s.error);
           }
+          if(s.status==='stopped'){
+            stopProgress();
+            fill.style.width = pct+'%';
+            meta.textContent = pct+'%  '+s.done+'/'+s.total+'  Stopped';
+            dl.href = '/scrape/download?job='+encodeURIComponent(currentJobId);
+            downloadPartial.style.display = 'inline-block';
+            downloadPartial.onclick = () => {
+              window.location.href = '/scrape/download?job='+encodeURIComponent(currentJobId);
+            };
+            doneBox.style.display = 'block';
+          }
         }, 600);
+      });
+
+      stopBtn.addEventListener('click', async ()=>{
+        if (currentJobId) {
+          await fetch('/scrape/stop?job='+encodeURIComponent(currentJobId), {method:'POST'});
+        }
       });
     </script>
     `,
@@ -454,45 +623,102 @@ app.get('/scrape', (req, res) => {
 
 app.post('/scrape/start', upload.single('file'), async (req, res) => {
   try {
+    // Check if there's already an active job
+    if (global.activeScrapeJob) {
+      return res.json({ ok:false, error:'A scraping task is already running. Please wait for it to complete or stop it first.' });
+    }
+
     if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
-    const delay = Math.max(0, parseInt(req.body.delay || SCRAPE_DELAY_MS, 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 5));
+    
+    const delay = Math.max(0, parseInt(req.body.delay || '100', 10));
+    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '4', 10), 8));
+    const retries = Math.max(1, Math.min(parseInt(req.body.retries || '3', 10), 5));
+    const cacheDuration = Math.max(1, Math.min(parseInt(req.body.cacheDuration || '5', 10), 60));
 
     const content = req.file.buffer.toString('utf8');
-    const usernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    if (!usernames.length) return res.json({ ok:false, error:'Empty file' });
+    const rawUsernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    if (!rawUsernames.length) return res.json({ ok:false, error:'Empty file' });
+
+    // Remove duplicates and track count
+    const uniqueUsernames = [...new Set(rawUsernames.map(u => u.toLowerCase()))];
+    const duplicatesRemoved = rawUsernames.length - uniqueUsernames.length;
+
+    // Reset performance stats
+    performanceStats.totalRequests = 0;
+    performanceStats.successfulRequests = 0;
+    performanceStats.failedRequests = 0;
+    performanceStats.cacheHits = 0;
+    performanceStats.duplicatesRemoved = duplicatesRemoved;
+    performanceStats.startTime = Date.now();
+    performanceStats.lastRequestTime = null;
 
     const jobId = crypto.randomBytes(8).toString('hex');
-    const job = { total: usernames.length, done: 0, start: Date.now(), rows: [], status: 'running', error: null, delay, conc };
+    const job = { 
+      total: uniqueUsernames.length, 
+      done: 0, 
+      start: Date.now(), 
+      rows: [], 
+      status: 'running', 
+      error: null, 
+      delay, 
+      conc, 
+      retries,
+      cacheDuration,
+      stopped: false,
+      stats: {
+        successfulRequests: 0,
+        failedRequests: 0,
+        cacheHits: 0,
+        duplicatesRemoved,
+        totalRequests: 0,
+        elapsedTime: 0
+      }
+    };
+    
     scrapeJobs.set(jobId, job);
+    global.activeScrapeJob = jobId; // Set active job
 
     // background worker
     (async () => {
-      const queue = usernames.slice();
+      const queue = uniqueUsernames.slice();
       const workers = new Array(job.conc).fill(0).map(async () => {
-        while (queue.length) {
+        while (queue.length && !job.stopped) {
           const u = queue.shift();
+          if (job.stopped) break;
+          
           try {
-            const p = await fetchProfile(u);
+            const p = await fetchProfile(u, job.retries);
             const row = mapToCsvRow(p, u);
             job.rows.push(row);
+            job.stats.successfulRequests++;
           } catch (e) {
             job.rows.push({
               'Username': u, 'Name':'', 'Media Count':null, 'Followers Ordered':null, 'Followers':null, 'Following':null, 'Link in bio?':'FALSE', 'Private?':'FALSE', _error: e.message
             });
+            job.stats.failedRequests++;
           } finally {
             job.done++;
-            if (job.delay) await sleep(job.delay);
+            job.stats.totalRequests = performanceStats.totalRequests;
+            job.stats.cacheHits = performanceStats.cacheHits;
+            job.stats.elapsedTime = (Date.now() - job.start) / 1000;
+            
+            if (job.delay && !job.stopped) await sleep(job.delay);
           }
         }
       });
 
       try {
         await Promise.all(workers);
-        job.status = 'done';
+        if (job.stopped) {
+          job.status = 'stopped';
+        } else {
+          job.status = 'done';
+        }
       } catch (e) {
         job.status = 'error';
         job.error = e.message;
+      } finally {
+        global.activeScrapeJob = null; // Clear active job
       }
     })();
 
@@ -506,17 +732,58 @@ app.get('/scrape/status', (req, res) => {
   const id = (req.query.job || '').trim();
   const job = scrapeJobs.get(id);
   if (!job) return res.json({ ok:false, error:'job not found' });
+  
   const elapsed = (Date.now() - job.start) / 1000;
   const rate = job.done > 0 ? job.done / elapsed : 0;
   const remaining = Math.max(0, job.total - job.done);
   const eta_s = rate > 0 ? remaining / rate : null;
-  res.json({ ok:true, status: job.status, done: job.done, total: job.total, eta_s, error: job.error || null });
+  
+  // Update job stats
+  job.stats.elapsedTime = elapsed;
+  job.stats.totalRequests = performanceStats.totalRequests;
+  job.stats.cacheHits = performanceStats.cacheHits;
+  
+  res.json({ 
+    ok:true, 
+    status: job.status, 
+    done: job.done, 
+    total: job.total, 
+    eta_s, 
+    error: job.error || null,
+    stats: job.stats
+  });
+});
+
+// Check if there's an active scraping job
+app.get('/scrape/active', (req, res) => {
+  res.json({ 
+    active: !!global.activeScrapeJob,
+    jobId: global.activeScrapeJob || null
+  });
+});
+
+// Stop an active scraping job
+app.post('/scrape/stop', (req, res) => {
+  const id = (req.query.job || '').trim();
+  const job = scrapeJobs.get(id);
+  if (!job) return res.json({ ok:false, error:'job not found' });
+  
+  if (job.status === 'running') {
+    job.stopped = true;
+    job.status = 'stopped';
+    global.activeScrapeJob = null;
+    res.json({ ok:true, message:'Scraping stopped' });
+  } else {
+    res.json({ ok:false, error:'Job is not running' });
+  }
 });
 
 app.get('/scrape/download', (req, res) => {
   const id = (req.query.job || '').trim();
   const job = scrapeJobs.get(id);
-  if (!job || job.status !== 'done') return res.status(404).send('Job not ready');
+  if (!job || (job.status !== 'done' && job.status !== 'stopped')) {
+    return res.status(404).send('Job not ready');
+  }
 
   const fields = ['Username','Name','Media Count','Followers Ordered','Followers','Following','Link in bio?','Private?'];
   const example = job.rows.find(r => Object.keys(r).some(k => k.startsWith('_'))) || {};
@@ -524,7 +791,8 @@ app.get('/scrape/download', (req, res) => {
   const parser = new Parser({ fields: fields.concat(extra) });
 
   const csv = parser.parse(job.rows);
-  res.setHeader('Content-Disposition', `attachment; filename="profiles_${Date.now()}.csv"`);
+  const statusSuffix = job.status === 'stopped' ? '_partial' : '';
+  res.setHeader('Content-Disposition', `attachment; filename="profiles${statusSuffix}_${Date.now()}.csv"`);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.send(csv);
 });

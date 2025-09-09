@@ -28,13 +28,23 @@ The scrape and format function was running 6x slower than yesterday, likely due 
 - Atomic progress tracking
 - Duplicate username removal before processing
 
-### 4. **Performance Monitoring**
+### 4. **Performance Monitoring & Task Management**
 - Real-time statistics display (success/error/cache hits)
 - Request rate monitoring (requests per second)
 - Duplicate detection and reporting
 - Enhanced progress bar with detailed metrics
+- Single-task management (prevents concurrent scraping)
+- Stop button functionality with partial CSV export
+- Elapsed time tracking and ETA calculations
 
-### 5. **Configuration Options**
+### 5. **Task Management Features**
+- **Single Task Enforcement**: Only one scraping task can run at a time
+- **Stop Button**: Cancel ongoing tasks and export partial results
+- **Partial CSV Export**: Download current scraped data when stopped
+- **Active Job Detection**: Prevents multiple concurrent API calls
+- **Graceful Shutdown**: Workers stop cleanly when task is cancelled
+
+### 6. **Configuration Options**
 - Adjustable delay between requests (default: 100ms)
 - Configurable concurrency (1-8 workers, default: 4)
 - Retry attempts (1-5, default: 3)
@@ -80,8 +90,12 @@ The enhanced interface now shows:
 - ✓ Success count
 - ✗ Error count  
 - 🚀 Cache hits
-- Request rate (req/s)
-- Duplicate removal count
+- 📊 Request rate (req/s)
+- 🔄 Duplicate removal count
+- ⏱️ Elapsed time
+- Progress percentage with ETA
+- Stop button for task cancellation
+- Partial CSV download when stopped
 
 ## Technical Details
 
