@@ -467,26 +467,20 @@ const rateLimiter = new RateLimiter(25, 3); // 25 req/s max, 3 concurrent
 function clearOrphanedTasks() {
   console.log('Checking for orphaned tasks from previous sessions...');
   
-  // Clear any existing rate limiter queue that might be from previous session
-  rateLimiter.clearQueue();
-  
-  // Reset all tracking variables
-  activeScrapeJob = null;
-  jobCancelled = true; // Set to true to stop any orphaned background processing
-  
-  // Clear any existing jobs that might be from previous session
-  scrapeJobs.clear();
-  
-  // Reset global abort controller
-  if (globalAbortController) {
-    globalAbortController.abort();
-    globalAbortController = null;
+  // Only clear if there are actually orphaned tasks (active requests but no tracked job)
+  if (rateLimiter.activeRequests > 0 && !activeScrapeJob) {
+    console.log('Found orphaned tasks, clearing...');
+    rateLimiter.clearQueue();
   }
   
-  console.log('Orphaned tasks cleared, ready for new jobs');
+  // Don't reset jobCancelled to true as it breaks new jobs
+  // Don't clear scrapeJobs as it might contain valid jobs
+  // Don't reset activeScrapeJob as it might be valid
+  
+  console.log('Orphaned task check completed');
 }
 
-// Clear orphaned tasks on app start
+// Clear orphaned tasks on app start (but don't be too aggressive)
 clearOrphanedTasks();
 
 // Add a periodic check for orphaned tasks that might be running
@@ -494,13 +488,13 @@ setInterval(() => {
   const now = Date.now();
   const timeSinceStart = now - appStartTime;
   
-  // If we've been running for more than 5 minutes and there are active requests but no tracked job,
-  // it might be an orphaned task
-  if (timeSinceStart > 5 * 60 * 1000 && rateLimiter.activeRequests > 0 && !activeScrapeJob) {
-    console.log('Detected potential orphaned tasks - clearing rate limiter queue');
+  // Only check for orphaned tasks if we've been running for more than 10 minutes
+  // and there are active requests but no tracked job
+  if (timeSinceStart > 10 * 60 * 1000 && rateLimiter.activeRequests > 0 && !activeScrapeJob) {
+    console.log('Detected potential orphaned tasks after 10 minutes - clearing rate limiter queue');
     rateLimiter.clearQueue();
   }
-}, 30 * 1000); // Check every 30 seconds
+}, 60 * 1000); // Check every 60 seconds (less frequent)
 
 
 function pickProfile(payload) {
@@ -1776,6 +1770,19 @@ app.post('/scrape/force-clear', (req, res) => {
   
   console.log('Force clear completed - all tasks and orphaned processes cleared');
   res.json({ ok: true, message: 'Force clear completed - all tasks and orphaned processes cleared' });
+});
+
+// Debug endpoint to check current status
+app.get('/scrape/debug', (req, res) => {
+  res.json({
+    ok: true,
+    activeScrapeJob,
+    jobCancelled,
+    scrapeJobsCount: scrapeJobs.size,
+    rateLimiterStatus: rateLimiter.getStatus(),
+    appStartTime: new Date(appStartTime).toISOString(),
+    timeSinceStart: Date.now() - appStartTime
+  });
 });
 
 app.get('/scrape/active', (req, res) => {
