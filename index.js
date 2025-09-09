@@ -33,7 +33,7 @@ const {
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi.com';
 const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || '4', 10);
-const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '180', 10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '135', 10);
 
 const IS_PROD = NODE_ENV === 'production';
 
