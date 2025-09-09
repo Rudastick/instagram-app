@@ -317,6 +317,20 @@ if (!RAPIDAPI_KEY) console.warn('WARNING: RAPIDAPI_KEY missing – /scrape will 
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// Request cache to avoid duplicate API calls
+const requestCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+// Clean up cache periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of requestCache.entries()) {
+    if (now - value.timestamp > CACHE_TTL) {
+      requestCache.delete(key);
+    }
+  }
+}, 60000); // Clean every minute
+
 function pickProfile(payload) {
   if (payload && typeof payload === 'object') {
     if (payload.data && typeof payload.data === 'object') return payload.data;
@@ -325,22 +339,74 @@ function pickProfile(payload) {
   return payload;
 }
 
-async function fetchProfile(username) {
-  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
-  const res = await fetch(url, {
-    headers: {
-      'x-rapidapi-host': RAPIDAPI_HOST,
-      'x-rapidapi-key': RAPIDAPI_KEY
-    }
-  });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch (e) {
-    throw new Error(`Non-JSON: ${text.slice(0,120)}`);
+async function fetchProfile(username, retries = 3) {
+  // Check cache first
+  const cacheKey = username.toLowerCase();
+  const cached = requestCache.get(cacheKey);
+  if (cached && (Date.now() - cached.timestamp) < CACHE_TTL) {
+    return cached.data;
   }
-  const p = pickProfile(json);
-  if (!p || typeof p !== 'object') throw new Error('No profile object');
-  return p;
+
+  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+  
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
+      
+      const res = await fetch(url, {
+        headers: {
+          'x-rapidapi-host': RAPIDAPI_HOST,
+          'x-rapidapi-key': RAPIDAPI_KEY,
+          'User-Agent': 'Mozilla/5.0 (compatible; InstagramScraper/1.0)'
+        },
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+      
+      if (!res.ok) {
+        if (res.status === 429) { // Rate limited
+          const retryAfter = parseInt(res.headers.get('retry-after') || '60', 10);
+          console.log(`Rate limited for ${username}, waiting ${retryAfter}s`);
+          await sleep(retryAfter * 1000);
+          continue;
+        }
+        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+      }
+      
+      const text = await res.text();
+      let json;
+      try { 
+        json = JSON.parse(text); 
+      } catch (e) {
+        throw new Error(`Invalid JSON response: ${text.slice(0,120)}`);
+      }
+      
+      const p = pickProfile(json);
+      if (!p || typeof p !== 'object') {
+        throw new Error('No valid profile data in response');
+      }
+      
+      // Cache successful response
+      requestCache.set(cacheKey, {
+        data: p,
+        timestamp: Date.now()
+      });
+      
+      return p;
+      
+    } catch (error) {
+      if (attempt === retries) {
+        throw error;
+      }
+      
+      // Exponential backoff with jitter
+      const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
+      console.log(`Attempt ${attempt} failed for ${username}, retrying in ${Math.round(delay)}ms:`, error.message);
+      await sleep(delay);
+    }
+  }
 }
 
 // Map API → Airtable-style CSV (Username first)
@@ -926,8 +992,12 @@ app.get('/scrape', (req, res) => {
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="135"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="5" value="${SCRAPE_CONCURRENCY}"/></div>
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="100" title="Lower delay = faster but may hit rate limits"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="8" value="${SCRAPE_CONCURRENCY}" title="Higher concurrency = faster but more resource intensive"/></div>
+        </div>
+        <div class="row">
+          <div><label>Retry attempts</label><input type="number" name="retries" min="1" max="5" value="3" title="Number of retries for failed requests"/></div>
+          <div><label>Cache duration (min)</label><input type="number" name="cache" min="1" max="60" value="5" title="How long to cache successful requests"/></div>
         </div>
         <button type="submit">Start Scrape</button>
       </form>
@@ -970,12 +1040,25 @@ app.get('/scrape', (req, res) => {
           const pct = s.total ? Math.round((s.done/s.total)*100) : 0;
           fill.style.width = pct+'%';
           const eta = s.eta_s != null ? s.eta_s : 0;
-          meta.textContent = pct+'%  '+s.done+'/'+s.total+'  ETA '+(eta>60?Math.round(eta/60)+'m':Math.round(eta)+'s');
+          
+          // Enhanced status display
+          let statusText = pct+'%  '+s.done+'/'+s.total;
+          if(s.rate) statusText += '  ('+s.rate+' req/s)';
+          if(eta > 0) statusText += '  ETA '+(eta>60?Math.round(eta/60)+'m':Math.round(eta)+'s');
+          if(s.successCount || s.errorCount || s.cacheHits) {
+            statusText += '  ✓'+s.successCount+' ✗'+s.errorCount+' 🚀'+s.cacheHits;
+          }
+          meta.textContent = statusText;
 
           if(s.status==='done'){
             clearInterval(timer);
             fill.style.width = '100%';
-            meta.textContent = '100%  '+s.done+'/'+s.total+'  Completed';
+            let finalText = '100%  '+s.done+'/'+s.total+'  Completed';
+            if(s.duplicateCount > 0) finalText += '  (removed '+s.duplicateCount+' duplicates)';
+            if(s.successCount || s.errorCount || s.cacheHits) {
+              finalText += '  ✓'+s.successCount+' ✗'+s.errorCount+' 🚀'+s.cacheHits;
+            }
+            meta.textContent = finalText;
             dl.href = '/scrape/download?job='+encodeURIComponent(job);
             doneBox.style.display = 'block';
           }
@@ -995,44 +1078,131 @@ app.get('/scrape', (req, res) => {
 app.post('/scrape/start', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
-    const delay = Math.max(0, parseInt(req.body.delay || '135', 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 5));
+    
+    const delay = Math.max(0, parseInt(req.body.delay || '100', 10));
+    const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 8));
+    const retries = Math.max(1, Math.min(parseInt(req.body.retries || '3', 10), 5));
+    const cacheMinutes = Math.max(1, Math.min(parseInt(req.body.cache || '5', 10), 60));
 
     const content = req.file.buffer.toString('utf8');
     const usernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
     if (!usernames.length) return res.json({ ok:false, error:'Empty file' });
 
+    // Remove duplicates while preserving order
+    const uniqueUsernames = [...new Set(usernames.map(u => u.toLowerCase()))];
+    const duplicateCount = usernames.length - uniqueUsernames.length;
+    
+    if (duplicateCount > 0) {
+      console.log(`Removed ${duplicateCount} duplicate usernames`);
+    }
+
     const jobId = crypto.randomBytes(8).toString('hex');
-    const job = { total: usernames.length, done: 0, start: Date.now(), rows: [], status: 'running', error: null, delay, conc };
+    const job = { 
+      total: uniqueUsernames.length, 
+      done: 0, 
+      start: Date.now(), 
+      rows: [], 
+      status: 'running', 
+      error: null, 
+      delay, 
+      conc, 
+      retries,
+      cacheMinutes,
+      duplicateCount,
+      successCount: 0,
+      errorCount: 0,
+      cacheHits: 0
+    };
     scrapeJobs.set(jobId, job);
 
-    // background worker
+    // background worker with improved concurrency
     (async () => {
-      const queue = usernames.slice();
-      const workers = new Array(job.conc).fill(0).map(async () => {
-        while (queue.length) {
-          const u = queue.shift();
+      const queue = [...uniqueUsernames]; // Use deduplicated usernames
+      const results = new Array(uniqueUsernames.length); // Pre-allocate results array
+      const usernameToIndex = new Map(uniqueUsernames.map((u, i) => [u, i]));
+      
+      // Process in batches to avoid overwhelming the API
+      const batchSize = Math.max(1, Math.floor(job.conc * 2));
+      
+      const processBatch = async (batch) => {
+        const promises = batch.map(async (username) => {
+          const globalIndex = usernameToIndex.get(username);
+          const wasCached = requestCache.has(username.toLowerCase());
+          
           try {
-            const p = await fetchProfile(u);
-            const row = mapToCsvRow(p, u);
-            job.rows.push(row);
+            const p = await fetchProfile(username, job.retries);
+            const row = mapToCsvRow(p, username);
+            results[globalIndex] = row;
+            
+            // Update statistics
+            job.successCount++;
+            if (wasCached) {
+              job.cacheHits++;
+            }
+            
           } catch (e) {
-            job.rows.push({
-              'Username': u, 'Name':'', 'Media Count':null, 'Followers Ordered':null, 'Followers':null, 'Following':null, 'Link in bio?':'FALSE', 'Private?':'FALSE', _error: e.message
-            });
-          } finally {
-            job.done++;
-            if (job.delay) await sleep(job.delay);
+            results[globalIndex] = {
+              'Username': username, 
+              'Name':'', 
+              'Media Count':null, 
+              'Followers Ordered':null, 
+              'Followers':null, 
+              'Following':null, 
+              'Link in bio?':'FALSE', 
+              'Private?':'FALSE', 
+              _error: e.message
+            };
+            job.errorCount++;
+          }
+          
+          // Update progress atomically
+          job.done++;
+          
+          // Add delay between requests to respect rate limits
+          if (job.delay) {
+            await sleep(job.delay);
+          }
+        });
+        
+        await Promise.allSettled(promises);
+      };
+      
+      try {
+        // Process in batches
+        for (let i = 0; i < queue.length; i += batchSize) {
+          const batch = queue.slice(i, i + batchSize);
+          await processBatch(batch);
+          
+          // Add delay between batches to prevent rate limiting
+          if (i + batchSize < queue.length && job.delay) {
+            await sleep(job.delay * 2);
           }
         }
-      });
-
-      try {
-        await Promise.all(workers);
+        
+        // Filter out undefined results and assign to job.rows
+        job.rows = results.filter(row => row !== undefined);
         job.status = 'done';
+        
+        // Log performance statistics
+        const duration = (Date.now() - job.start) / 1000;
+        const rate = job.done / duration;
+        console.log(`Scraping completed: ${job.done}/${job.total} in ${duration.toFixed(1)}s (${rate.toFixed(1)} req/s)`);
+        console.log(`Success: ${job.successCount}, Errors: ${job.errorCount}, Cache hits: ${job.cacheHits}`);
+        
+        // Clean up cache periodically
+        if (requestCache.size > 1000) {
+          const now = Date.now();
+          for (const [key, value] of requestCache.entries()) {
+            if (now - value.timestamp > CACHE_TTL) {
+              requestCache.delete(key);
+            }
+          }
+        }
+        
       } catch (e) {
         job.status = 'error';
         job.error = e.message;
+        console.error('Scraping job failed:', e);
       }
     })();
 
@@ -1046,11 +1216,25 @@ app.get('/scrape/status', (req, res) => {
   const id = (req.query.job || '').trim();
   const job = scrapeJobs.get(id);
   if (!job) return res.json({ ok:false, error:'job not found' });
+  
   const elapsed = (Date.now() - job.start) / 1000;
   const rate = job.done > 0 ? job.done / elapsed : 0;
   const remaining = Math.max(0, job.total - job.done);
   const eta_s = rate > 0 ? remaining / rate : null;
-  res.json({ ok:true, status: job.status, done: job.done, total: job.total, eta_s, error: job.error || null });
+  
+  res.json({ 
+    ok: true, 
+    status: job.status, 
+    done: job.done, 
+    total: job.total, 
+    eta_s, 
+    error: job.error || null,
+    successCount: job.successCount || 0,
+    errorCount: job.errorCount || 0,
+    cacheHits: job.cacheHits || 0,
+    duplicateCount: job.duplicateCount || 0,
+    rate: Math.round(rate * 10) / 10
+  });
 });
 
 app.get('/scrape/download', (req, res) => {
