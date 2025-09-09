@@ -1208,7 +1208,7 @@ app.get('/scrape', (req, res) => {
     'Scrape & Format IG',
     `
     <div class="card">
-      <form id="scrapeForm" enctype="multipart/form-data">
+      <form id="scrapeForm" method="POST" enctype="multipart/form-data">
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
@@ -1223,7 +1223,7 @@ app.get('/scrape', (req, res) => {
           <span id="rateInfo">Current settings: ~15 req/s</span>
         </div>
         <div class="actions">
-          <button type="submit">Start Scrape</button>
+          <button type="button" id="startScrapeBtn">Start Scrape</button>
           <button type="button" id="cancelBtn" style="background: linear-gradient(180deg,#dc3545,#c82333); display:none;">Cancel Current Job</button>
           <button type="button" id="clearAllBtn" style="background: linear-gradient(180deg,#6c757d,#5a6268);">Clear All Jobs & Reset API</button>
           <button type="button" id="forceClearBtn" style="background: linear-gradient(180deg,#dc3545,#a52929);">Force Clear All (Including Orphaned Tasks)</button>
@@ -1244,12 +1244,14 @@ app.get('/scrape', (req, res) => {
     </div>
 
     <script>
+      document.addEventListener('DOMContentLoaded', function() {
       const form = document.getElementById('scrapeForm');
       const fill = document.getElementById('fill');
       const meta = document.getElementById('meta');
       const doneBox = document.getElementById('doneBox');
       const dl = document.getElementById('dl');
       const rateInfo = document.getElementById('rateInfo');
+      const startScrapeBtn = document.getElementById('startScrapeBtn');
       const cancelBtn = document.getElementById('cancelBtn');
       const clearAllBtn = document.getElementById('clearAllBtn');
       const forceClearBtn = document.getElementById('forceClearBtn');
@@ -1359,7 +1361,7 @@ app.get('/scrape', (req, res) => {
       }
       checkActiveJobs();
 
-      form.addEventListener('submit', async (e)=>{
+      startScrapeBtn.addEventListener('click', async (e)=>{
         e.preventDefault();
         progressCard.style.display = 'block'; // Show progress card when starting
         doneBox.style.display = 'none';
@@ -1368,12 +1370,19 @@ app.get('/scrape', (req, res) => {
         cancelBtn.style.display = 'inline-block'; // Show cancel button when starting
 
         const fd = new FormData(form);
-        const r = await fetch('/scrape/start', { method:'POST', body: fd });
-        const j = await r.json();
-        if(!j.ok){ 
+        let j;
+        try {
+          const r = await fetch('/scrape/start', { method:'POST', body: fd });
+          j = await r.json();
+          if(!j.ok){ 
+            progressCard.style.display = 'none'; // Hide progress card on error
+            alert('Error: '+(j.error||'unknown')); 
+            return; 
+          }
+        } catch (error) {
           progressCard.style.display = 'none'; // Hide progress card on error
-          alert('Error: '+(j.error||'unknown')); 
-          return; 
+          alert('Network error: ' + error.message);
+          return;
         }
 
         const job = j.jobId;
@@ -1433,7 +1442,7 @@ app.get('/scrape', (req, res) => {
           }
         }, 600);
       });
-
+      }); // End of DOMContentLoaded
     </script>
     `,
     req
