@@ -32,6 +32,8 @@ const {
 
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi.com';
+const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || '1', 10);
+const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '200', 10);
 
 const IS_PROD = NODE_ENV === 'production';
 
@@ -65,36 +67,8 @@ app.use(
 // Static for branding
 app.use('/static', express.static(path.join(__dirname, 'static')));
 
-// Simple scraping state
-let currentScrapeJob = null;
-let scrapeStartTime = null;
-
-// Rate limiting tracking
-let requestCount = 0;
-let rateLimitResetTime = Date.now() + 1000; // Reset every second
-
-// Rate limiting function
-async function waitForRateLimit() {
-  const now = Date.now();
-  
-  // Reset counter if a second has passed
-  if (now >= rateLimitResetTime) {
-    requestCount = 0;
-    rateLimitResetTime = now + 1000;
-  }
-  
-  // If we've hit the rate limit, wait until next second
-  if (requestCount >= 30) {
-    const waitTime = rateLimitResetTime - now;
-    if (waitTime > 0) {
-      await new Promise(resolve => setTimeout(resolve, waitTime));
-      requestCount = 0;
-      rateLimitResetTime = Date.now() + 1000;
-    }
-  }
-  
-  requestCount++;
-}
+// Scrape jobs (in-memory per-process)
+const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc }
 
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -339,295 +313,137 @@ async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
   } catch (e) { console.error('Log error:', e); }
 }
 
-// Enhanced Instagram API helper with timeout, retry, and rate limiting
-async function fetchProfile(username, retries = 2) {
-  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
-  
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      // Wait for rate limit availability
-      await waitForRateLimit();
-      
-      // Create AbortController for timeout
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 6000); // 6 second timeout (reduced further)
-      
-      const res = await fetch(url, {
-        headers: {
-          'x-rapidapi-host': RAPIDAPI_HOST,
-          'x-rapidapi-key': RAPIDAPI_KEY,
-          'User-Agent': 'Mozilla/5.0 (compatible; InstagramScraper/1.0)',
-          'Accept': 'application/json',
-          'Cache-Control': 'no-cache',
-          'Connection': 'keep-alive'
-        },
-        signal: controller.signal,
-        method: 'GET'
-      });
-      
-      clearTimeout(timeoutId);
-      
-      if (!res.ok) {
-        if (res.status === 429) {
-          // Rate limited - wait longer before retry
-          if (attempt < retries) {
-            await new Promise(resolve => setTimeout(resolve, 2000 * (attempt + 1)));
-            continue;
-          }
-        }
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-      
-      const json = await res.json();
-      return json;
-      
-    } catch (error) {
-      if (error.name === 'AbortError') {
-        throw new Error(`Request timeout for @${username}`);
-      }
-      
-      if (attempt === retries) {
-        throw error;
-      }
-      
-      // Wait before retry (exponential backoff)
-      await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
-    }
+// ---- IG Scraper helpers ----
+if (!RAPIDAPI_KEY) console.warn('WARNING: RAPIDAPI_KEY missing – /scrape will fail until set.');
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function pickProfile(payload) {
+  if (payload && typeof payload === 'object') {
+    if (payload.data && typeof payload.data === 'object') return payload.data;
+    if (payload.profile && typeof payload.profile === 'object') return payload.profile;
   }
+  return payload;
 }
 
-// ===== New Simple Scrape & Format IG =====
+async function fetchProfile(username) {
+  const url = `https://${RAPIDAPI_HOST}/profile?username=${encodeURIComponent(username)}`;
+  const res = await fetch(url, {
+    headers: {
+      'x-rapidapi-host': RAPIDAPI_HOST,
+      'x-rapidapi-key': RAPIDAPI_KEY
+    }
+  });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch (e) {
+    throw new Error(`Non-JSON: ${text.slice(0,120)}`);
+  }
+  const p = pickProfile(json);
+  if (!p || typeof p !== 'object') throw new Error('No profile object');
+  return p;
+}
+
+// Map API → Airtable-style CSV (Username first)
+function mapToCsvRow(p, inputUsername) {
+  const media_count =
+    p.media_count ??
+    p.edge_owner_to_timeline_media?.count ??
+    p.timeline_media_count ?? null;
+
+  const followers =
+    p.followers_count ??
+    p.follower_count ??
+    p.edge_followed_by?.count ?? null;
+
+  const following =
+    p.following_count ??
+    p.edge_follow?.count ?? null;
+
+  const bioLinksArr = Array.isArray(p.bio_links) ? p.bio_links : [];
+  const linkInBio = bioLinksArr.length > 0;
+  const isPrivate = !!(p.is_private);
+
+  return {
+    'Username': inputUsername,
+    'Name': p.full_name || p.fullName || p.name || '',
+    'Media Count': media_count == null ? null : Number(media_count),
+    'Followers Ordered': followers == null ? null : Number(followers),
+    'Followers': followers == null ? null : Number(followers),
+    'Following': following == null ? null : Number(following),
+    'Link in bio?': linkInBio ? 'TRUE' : 'FALSE',
+    'Private?': isPrivate ? 'TRUE' : 'FALSE'
+  };
+}
+
+// ===== Scrape & Format IG (new) =====
 app.get('/scrape', (req, res) => {
   const html = renderPage(
     'Scrape & Format IG',
     `
     <div class="card">
-      <form id="scrapeForm" method="POST" enctype="multipart/form-data">
+      <form id="scrapeForm" enctype="multipart/form-data">
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per batch (ms)</label><input type="number" name="delay" min="0" value="0" title="Delay between batches (0 = no delay)"/></div>
-          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="30" value="25" title="Number of concurrent requests (max 30/sec)"/></div>
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="${SCRAPE_DELAY_MS}"/></div>
+          <div><label>Concurrency</label><input type="number" name="conc" min="1" max="5" value="${SCRAPE_CONCURRENCY}"/></div>
         </div>
-        <div class="muted" style="margin-top:8px;">API Rate Limit: 30 requests/second | Optimized settings: 25 concurrent, 0ms delay</div>
-        <div class="actions">
-          <button type="button" id="checkTasksBtn">Check Running Tasks</button>
-          <button type="button" id="testApiBtn">Test API Health</button>
-          <button type="button" id="closeAllBtn" style="display:none; background: linear-gradient(180deg,#dc3545,#c82333);">Close All Tasks</button>
-          <button type="button" id="startScrapeBtn">Start Scrape</button>
-        </div>
+        <button type="submit">Start Scrape</button>
       </form>
     </div>
 
-    <div class="card" id="progressCard" style="display:none;">
+    <div class="card">
       <label>Progress</label>
       <div id="bar" style="height:16px;background:#0f172f;border:1px solid #223064;border-radius:8px;overflow:hidden;">
         <div id="fill" style="height:100%;width:0%;background:linear-gradient(90deg,#6a0dad,#52118e);"></div>
       </div>
       <div class="muted" id="meta" style="margin-top:8px;">0%</div>
-      <div id="timeDisplay" style="margin-top:8px; font-weight:bold; color:#6a0dad;">Elapsed: 00:00 | ETA: --:--</div>
-      <div id="statusDisplay" style="margin-top:8px; font-size:13px; color:#9ec1ff; word-wrap:break-word; line-height:1.4;">Ready to start...</div>
       <div id="doneBox" style="display:none;margin-top:10px;">
         <a id="dl" href="#" class="muted">Download CSV</a>
       </div>
     </div>
 
     <script>
-      document.addEventListener('DOMContentLoaded', function() {
-        const form = document.getElementById('scrapeForm');
-        const fill = document.getElementById('fill');
-        const meta = document.getElementById('meta');
-        const timeDisplay = document.getElementById('timeDisplay');
-        const statusDisplay = document.getElementById('statusDisplay');
-        const doneBox = document.getElementById('doneBox');
-        const dl = document.getElementById('dl');
-        const startScrapeBtn = document.getElementById('startScrapeBtn');
-        const checkTasksBtn = document.getElementById('checkTasksBtn');
-        const testApiBtn = document.getElementById('testApiBtn');
-        const closeAllBtn = document.getElementById('closeAllBtn');
-        const progressCard = document.getElementById('progressCard');
+      const form = document.getElementById('scrapeForm');
+      const fill = document.getElementById('fill');
+      const meta = document.getElementById('meta');
+      const doneBox = document.getElementById('doneBox');
+      const dl = document.getElementById('dl');
 
-        let startTime = null;
-        let timeInterval = null;
-        let lastProgressTime = null;
-        let lastProgressDone = 0;
+      form.addEventListener('submit', async (e)=>{
+        e.preventDefault();
+        doneBox.style.display = 'none';
+        fill.style.width = '0%';
+        meta.textContent = '0%';
 
-        // Check for running tasks on page load
-        checkTasksBtn.addEventListener('click', async () => {
-          try {
-            const response = await fetch('/scrape/check-tasks');
-            const result = await response.json();
-            if (result.ok && result.hasTasks) {
-              closeAllBtn.style.display = 'inline-block';
-              alert('Found running tasks from before. Click "Close All Tasks" to clear them.');
-            } else {
-              alert('No running tasks found.');
-            }
-          } catch (error) {
-            alert('Error checking tasks: ' + error.message);
+        const fd = new FormData(form);
+        const r = await fetch('/scrape/start', { method:'POST', body: fd });
+        const j = await r.json();
+        if(!j.ok){ alert('Error: '+(j.error||'unknown')); return; }
+
+        const job = j.jobId;
+
+        const timer = setInterval(async ()=>{
+          const s = await fetch('/scrape/status?job='+encodeURIComponent(job)).then(r=>r.json()).catch(()=>null);
+          if(!s) return;
+          const pct = s.total ? Math.round((s.done/s.total)*100) : 0;
+          fill.style.width = pct+'%';
+          const eta = s.eta_s != null ? s.eta_s : 0;
+          meta.textContent = pct+'%  '+s.done+'/'+s.total+'  ETA '+(eta>60?Math.round(eta/60)+'m':Math.round(eta)+'s');
+
+          if(s.status==='done'){
+            clearInterval(timer);
+            fill.style.width = '100%';
+            meta.textContent = '100%  '+s.done+'/'+s.total+'  Completed';
+            dl.href = '/scrape/download?job='+encodeURIComponent(job);
+            doneBox.style.display = 'block';
           }
-        });
-
-        // Test API health
-        testApiBtn.addEventListener('click', async () => {
-          testApiBtn.disabled = true;
-          testApiBtn.textContent = 'Testing...';
-          
-          try {
-            const response = await fetch('/scrape/api-health');
-            const result = await response.json();
-            
-            if (result.ok) {
-              alert('API Health Check:\n\nResponse Time: ' + result.responseTime + 'ms\nUsername: @' + result.profile.username + '\nFollowers: ' + result.profile.followers.toLocaleString() + '\nAPI Key: ' + result.apiKey + '\nAPI Host: ' + result.apiHost);
-            } else {
-              alert('API Health Check Failed:\n\nError: ' + result.error + '\nAPI Key: ' + result.apiKey + '\nAPI Host: ' + result.apiHost);
-            }
-          } catch (error) {
-            alert('Error testing API: ' + error.message);
-          } finally {
-            testApiBtn.disabled = false;
-            testApiBtn.textContent = 'Test API Health';
+          if(s.status==='error'){
+            clearInterval(timer);
+            alert('Scrape failed: '+s.error);
           }
-        });
-
-        // Close all tasks
-        closeAllBtn.addEventListener('click', async () => {
-          if (confirm('Are you sure you want to close all running tasks?')) {
-            try {
-              const response = await fetch('/scrape/close-all', { method: 'POST' });
-              const result = await response.json();
-              if (result.ok) {
-                closeAllBtn.style.display = 'none';
-                alert('All tasks closed successfully.');
-      } else {
-                alert('Failed to close tasks: ' + result.error);
-              }
-            } catch (error) {
-              alert('Error closing tasks: ' + error.message);
-            }
-          }
-        });
-
-        // Start scraping
-        startScrapeBtn.addEventListener('click', async (e) => {
-          e.preventDefault();
-          progressCard.style.display = 'block';
-          doneBox.style.display = 'none';
-          fill.style.width = '0%';
-          meta.textContent = '0%';
-          statusDisplay.textContent = 'Starting scrape...';
-          startTime = Date.now();
-          lastProgressTime = startTime;
-          lastProgressDone = 0;
-          
-          // Start time display
-          timeInterval = setInterval(() => {
-            const elapsed = Math.floor((Date.now() - startTime) / 1000);
-            const minutes = Math.floor(elapsed / 60);
-            const seconds = elapsed % 60;
-            timeDisplay.textContent = 'Elapsed: ' + minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0') + ' | ETA: --:--';
-          }, 1000);
-
-          const fd = new FormData(form);
-          try {
-            const r = await fetch('/scrape/start', { method: 'POST', body: fd });
-            const j = await r.json();
-            if (!j.ok) {
-              progressCard.style.display = 'none';
-              clearInterval(timeInterval);
-              alert('Error: ' + (j.error || 'unknown'));
-              return;
-            }
-
-            const jobId = j.jobId;
-            const timer = setInterval(async () => {
-              const s = await fetch('/scrape/status?job=' + encodeURIComponent(jobId)).then(r => r.json()).catch(() => null);
-              if (!s) return;
-              
-              const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
-              fill.style.width = pct + '%';
-              meta.textContent = pct + '% (' + s.done + '/' + s.total + ')';
-
-              // Calculate ETA - improved logic
-              const now = Date.now();
-              const elapsed = Math.floor((now - startTime) / 1000);
-              const elapsedMinutes = Math.floor(elapsed / 60);
-              const elapsedSeconds = elapsed % 60;
-              
-              // Always calculate ETA based on overall progress
-              if (s.done > 0 && s.done < s.total) {
-                const overallRate = s.done / elapsed; // items per second
-                if (overallRate > 0) {
-                  const remaining = s.total - s.done;
-                  const etaSeconds = Math.round(remaining / overallRate);
-                  const etaMinutes = Math.floor(etaSeconds / 60);
-                  const etaSecs = etaSeconds % 60;
-                  
-                  timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + 
-                    ' | ETA: ' + etaMinutes.toString().padStart(2, '0') + ':' + etaSecs.toString().padStart(2, '0');
-                } else {
-                  timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + ' | ETA: --:--';
-                }
-              } else if (s.done === 0) {
-                timeDisplay.textContent = 'Elapsed: ' + elapsedMinutes.toString().padStart(2, '0') + ':' + elapsedSeconds.toString().padStart(2, '0') + ' | ETA: --:--';
-              }
-
-              // Update status message with detailed info
-              if (s.done < s.total) {
-                let statusText = 'Processing usernames... (' + s.done + '/' + s.total + ' completed)';
-                if (s.currentUsername) {
-                  statusText += ' | Currently: @' + s.currentUsername;
-                }
-                if (s.successRate > 0) {
-                  statusText += ' | Success rate: ' + s.successRate + '%';
-                }
-                
-                // Add processing rate and rate limit info
-                if (elapsed > 0) {
-                  const rate = (s.done / elapsed).toFixed(1);
-                  statusText += ' | Rate: ' + rate + '/sec (max 30/sec)';
-                }
-                
-                if (s.completedUsernames && s.completedUsernames.length > 0) {
-                  statusText += ' | Recent: ' + s.completedUsernames.slice(-3).join(', ');
-                }
-                statusDisplay.textContent = statusText;
-              }
-
-              if (s.status === 'done') {
-                clearInterval(timer);
-                clearInterval(timeInterval);
-                fill.style.width = '100%';
-                meta.textContent = '100% Completed';
-                
-                const totalTime = Math.floor((Date.now() - startTime) / 1000);
-                const minutes = Math.floor(totalTime / 60);
-                const seconds = totalTime % 60;
-                const successCount = s.completedUsernames ? s.completedUsernames.length : 0;
-                const failedCount = s.failedUsernames ? s.failedUsernames.length : 0;
-                
-                statusDisplay.textContent = 'Scraping completed! Total time: ' + 
-                  minutes.toString().padStart(2, '0') + ':' + seconds.toString().padStart(2, '0') + 
-                  ' | Success: ' + successCount + ' | Failed: ' + failedCount + 
-                  ' | Success rate: ' + s.successRate + '%';
-                
-                dl.href = '/scrape/download?job=' + encodeURIComponent(jobId);
-                doneBox.style.display = 'block';
-              }
-              if (s.status === 'error') {
-                clearInterval(timer);
-                clearInterval(timeInterval);
-                statusDisplay.textContent = 'Scraping failed: ' + s.error;
-                alert('Scrape failed: ' + s.error);
-                progressCard.style.display = 'none';
-              }
-            }, 1000);
-    } catch (error) {
-            progressCard.style.display = 'none';
-            clearInterval(timeInterval);
-            alert('Network error: ' + error.message);
-          }
-        });
+        }, 600);
       });
     </script>
     `,
@@ -636,213 +452,81 @@ app.get('/scrape', (req, res) => {
   res.send(html);
 });
 
-// API endpoints
 app.post('/scrape/start', upload.single('file'), async (req, res) => {
   try {
-    if (!req.file) return res.json({ ok: false, error: 'No file uploaded' });
-    
-    if (currentScrapeJob) {
-      return res.json({ 
-        ok: false, 
-        error: 'Another scraping job is already running. Please wait for it to finish.' 
-      });
-    }
-    
-    const delay = Math.max(0, parseInt(req.body.delay || '0', 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '25', 10), 30));
+    if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
+    const delay = Math.max(0, parseInt(req.body.delay || SCRAPE_DELAY_MS, 10));
+    const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 5));
 
     const content = req.file.buffer.toString('utf8');
-    const usernames = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    if (!usernames.length) return res.json({ ok: false, error: 'Empty file' });
+    const usernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
+    if (!usernames.length) return res.json({ ok:false, error:'Empty file' });
 
     const jobId = crypto.randomBytes(8).toString('hex');
-    currentScrapeJob = {
-      id: jobId,
-      total: usernames.length,
-      done: 0,
-      start: Date.now(),
-      rows: [],
-      status: 'running',
-      error: null,
-      delay,
-      conc,
-      currentUsername: null,
-      completedUsernames: [],
-      failedUsernames: []
-    };
-    scrapeStartTime = Date.now();
+    const job = { total: usernames.length, done: 0, start: Date.now(), rows: [], status: 'running', error: null, delay, conc };
+    scrapeJobs.set(jobId, job);
 
-    // Background processing with concurrency
+    // background worker
     (async () => {
-      try {
-        const processUsername = async (username, index) => {
-          if (currentScrapeJob.status !== 'running') return;
-          
-          const startTime = Date.now();
-          currentScrapeJob.currentUsername = username;
-          
+      const queue = usernames.slice();
+      const workers = new Array(job.conc).fill(0).map(async () => {
+        while (queue.length) {
+          const u = queue.shift();
           try {
-            const profile = await fetchProfile(username);
-            const processingTime = Date.now() - startTime;
-            
-            const row = {
-              'Username': username,
-              'Name': profile.full_name || profile.name || '',
-              'Followers': profile.followers_count || profile.follower_count || 0,
-              'Following': profile.following_count || 0,
-              'Media Count': profile.media_count || 0,
-              'Private': profile.is_private ? 'TRUE' : 'FALSE',
-              'Processing Time (ms)': processingTime
-            };
-            
-            currentScrapeJob.rows[index] = row;
-            currentScrapeJob.completedUsernames.push(username);
-            
-            // Log slow requests
-            if (processingTime > 5000) {
-              console.log(`Slow request: @${username} took ${processingTime}ms`);
-            }
-            
-          } catch (error) {
-            const processingTime = Date.now() - startTime;
-            
-            const row = {
-              'Username': username,
-              'Name': '',
-              'Followers': 0,
-              'Following': 0,
-              'Media Count': 0,
-              'Private': 'FALSE',
-              'Error': error.message,
-              'Processing Time (ms)': processingTime
-            };
-            
-            currentScrapeJob.rows[index] = row;
-            currentScrapeJob.failedUsernames.push(username);
-            
-            console.log(`Failed request: @${username} - ${error.message} (${processingTime}ms)`);
+            const p = await fetchProfile(u);
+            const row = mapToCsvRow(p, u);
+            job.rows.push(row);
+          } catch (e) {
+            job.rows.push({
+              'Username': u, 'Name':'', 'Media Count':null, 'Followers Ordered':null, 'Followers':null, 'Following':null, 'Link in bio?':'FALSE', 'Private?':'FALSE', _error: e.message
+            });
+          } finally {
+            job.done++;
+            if (job.delay) await sleep(job.delay);
           }
-          
-          currentScrapeJob.done++;
-          currentScrapeJob.currentUsername = null;
-        };
-
-        // Process usernames in batches with concurrency
-        for (let i = 0; i < usernames.length; i += conc) {
-          if (currentScrapeJob.status !== 'running') break;
-          
-          const batch = usernames.slice(i, i + conc);
-          const promises = batch.map((username, batchIndex) => 
-            processUsername(username, i + batchIndex)
-          );
-          
-          await Promise.all(promises);
-          
-          // No delay needed since we're handling rate limiting at request level
-          // The rate limiter ensures we stay within 30 req/sec
         }
-        
-        currentScrapeJob.status = 'done';
-      } catch (error) {
-        currentScrapeJob.status = 'error';
-        currentScrapeJob.error = error.message;
+      });
+
+      try {
+        await Promise.all(workers);
+        job.status = 'done';
+      } catch (e) {
+        job.status = 'error';
+        job.error = e.message;
       }
     })();
 
-    res.json({ ok: true, jobId });
+    res.json({ ok:true, jobId });
   } catch (e) {
-    res.json({ ok: false, error: e.message });
+    res.json({ ok:false, error:e.message });
   }
 });
 
 app.get('/scrape/status', (req, res) => {
-  const jobId = req.query.job;
-  if (!currentScrapeJob || currentScrapeJob.id !== jobId) {
-    return res.json({ ok: false, error: 'Job not found' });
-  }
-  
-  res.json({
-    ok: true,
-    status: currentScrapeJob.status,
-    done: currentScrapeJob.done,
-    total: currentScrapeJob.total,
-    error: currentScrapeJob.error,
-    currentUsername: currentScrapeJob.currentUsername,
-    completedUsernames: currentScrapeJob.completedUsernames.slice(-5), // Last 5 completed
-    failedUsernames: currentScrapeJob.failedUsernames.slice(-5), // Last 5 failed
-    successRate: currentScrapeJob.done > 0 ? Math.round((currentScrapeJob.completedUsernames.length / currentScrapeJob.done) * 100) : 0
-  });
+  const id = (req.query.job || '').trim();
+  const job = scrapeJobs.get(id);
+  if (!job) return res.json({ ok:false, error:'job not found' });
+  const elapsed = (Date.now() - job.start) / 1000;
+  const rate = job.done > 0 ? job.done / elapsed : 0;
+  const remaining = Math.max(0, job.total - job.done);
+  const eta_s = rate > 0 ? remaining / rate : null;
+  res.json({ ok:true, status: job.status, done: job.done, total: job.total, eta_s, error: job.error || null });
 });
 
 app.get('/scrape/download', (req, res) => {
-  const jobId = req.query.job;
-  if (!currentScrapeJob || currentScrapeJob.id !== jobId || currentScrapeJob.status !== 'done') {
-    return res.status(404).send('Job not ready');
-  }
+  const id = (req.query.job || '').trim();
+  const job = scrapeJobs.get(id);
+  if (!job || job.status !== 'done') return res.status(404).send('Job not ready');
 
-  const fields = ['Username', 'Name', 'Followers', 'Following', 'Media Count', 'Private'];
-  const parser = new Parser({ fields });
-  const csv = parser.parse(currentScrapeJob.rows);
-  
+  const fields = ['Username','Name','Media Count','Followers Ordered','Followers','Following','Link in bio?','Private?'];
+  const example = job.rows.find(r => Object.keys(r).some(k => k.startsWith('_'))) || {};
+  const extra = Object.keys(example).filter(k => !fields.includes(k));
+  const parser = new Parser({ fields: fields.concat(extra) });
+
+  const csv = parser.parse(job.rows);
   res.setHeader('Content-Disposition', `attachment; filename="profiles_${Date.now()}.csv"`);
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.send(csv);
-});
-
-app.get('/scrape/check-tasks', (req, res) => {
-  res.json({
-    ok: true,
-    hasTasks: !!currentScrapeJob
-  });
-});
-
-// API health check for debugging
-app.get('/scrape/api-health', async (req, res) => {
-  try {
-    const testUsername = 'instagram'; // Use a known working username
-    const startTime = Date.now();
-    
-    const profile = await fetchProfile(testUsername);
-    const responseTime = Date.now() - startTime;
-    
-    res.json({
-      ok: true,
-      responseTime: responseTime,
-      profile: {
-        username: profile.username || 'N/A',
-        followers: profile.followers_count || profile.follower_count || 0,
-        hasData: !!(profile.username || profile.full_name)
-      },
-      apiKey: RAPIDAPI_KEY ? 'Configured' : 'Missing',
-      apiHost: RAPIDAPI_HOST
-    });
-  } catch (error) {
-    res.json({
-      ok: false,
-      error: error.message,
-      apiKey: RAPIDAPI_KEY ? 'Configured' : 'Missing',
-      apiHost: RAPIDAPI_HOST
-    });
-  }
-});
-
-app.post('/scrape/close-all', (req, res) => {
-  if (currentScrapeJob) {
-    currentScrapeJob.status = 'cancelled';
-    currentScrapeJob = null;
-    scrapeStartTime = null;
-  }
-  
-  res.json({ ok: true, message: 'All tasks closed' });
-});
-
-app.post('/scrape/delete', (req, res) => {
-  if (currentScrapeJob) {
-    currentScrapeJob = null;
-    scrapeStartTime = null;
-  }
-  
-  res.json({ ok: true, message: 'Current scrape deleted' });
 });
 // ===== Auth middleware =====
 
