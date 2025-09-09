@@ -678,6 +678,14 @@ app.get('/inventory/:model', async (req, res) => {
   const unusedForModel = model ? await Username.countDocuments({ used_by: { $ne: model } }) : total;
   res.json({ total, unusedForModel });
 });
+
+// ===== X Inventory counters API (for model select live update) =====
+app.get('/x/inventory/:model', async (req, res) => {
+  const model = (req.params.model || '').trim();
+  const total = await UsernameX.countDocuments({});
+  const unusedForModel = model ? await UsernameX.countDocuments({ used_by: { $ne: model } }) : total;
+  res.json({ total, unusedForModel });
+});
 // ===== Mass follow order formatter (VA-only page, but visible to others too) =====
 const MASS_PREFIX = process.env.MASS_PREFIX || '5566'; // constant at line start
 
@@ -747,6 +755,28 @@ async function takeUsernames(model, takeCount) {
   const ids = docs.map(d => d._id);
   if (ids.length) {
     await Username.updateMany(
+      { _id: { $in: ids } },
+      { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } }
+    );
+  }
+  return { usernames: docs.map(d => d.username), ids };
+}
+
+// X Format & Take helpers
+async function fetchXInventoryCounts(model) {
+  const total = await UsernameX.countDocuments({});
+  const unusedForModel = await UsernameX.countDocuments({ used_by: { $ne: model } });
+  return { total, unusedForModel };
+}
+
+async function takeXUsernames(model, takeCount) {
+  const docs = await UsernameX.find({ used_by: { $ne: model } })
+    .sort({ date_added: -1 })
+    .limit(takeCount)
+    .lean();
+  const ids = docs.map(d => d._id);
+  if (ids.length) {
+    await UsernameX.updateMany(
       { _id: { $in: ids } },
       { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } }
     );
@@ -1381,6 +1411,7 @@ app.get('/x', (req, res) => {
       <div class="actions">
         <a href="/x/add">Import X Usernames</a>
         <a href="/x/format">Format & Take X</a>
+        <a href="/x/revert">Revert X</a>
         <a href="/x/kpi">X KPI</a>
         <a href="/x/admin">X Admin Panel</a>
       </div>
@@ -1404,6 +1435,7 @@ app.get('/x/add', (req, res) => {
       </form>
       <div class="actions">
         <a href="/x/format">Format & Take X</a>
+        <a href="/x/revert">Revert X</a>
         <a href="/x/kpi">X KPI</a>
         <a href="/x/admin">X Admin Panel</a>
       </div>
@@ -1460,42 +1492,231 @@ app.post('/x/add', upload.single('file'), async (req, res) => {
   res.send(html);
 });
 
-// X Format & Take (placeholder for now)
-app.get('/x/format', (req, res) => {
+// X Format & Take
+app.get('/x/format', async (req, res) => {
+  const models = await ModelX.find({}).sort({ name: 1 }).lean();
+  const options = models.length
+    ? models.map(m => `<option value="${m.name}">${m.name}</option>`).join('')
+    : `<option value="Natalie">Natalie</option>`;
+
   const html = renderPage(
     'Format & Take X Usernames',
     `
     <div class="card">
-      <h2>Format & Take X Usernames</h2>
-      <p class="muted">This functionality will be implemented later. For now, this is a placeholder.</p>
-      <div class="actions">
-        <a href="/x/add">Import X Usernames</a>
-        <a href="/x/kpi">X KPI</a>
-        <a href="/x/admin">X Admin Panel</a>
-      </div>
+      <form action="/x/format" method="post" id="xFormatForm">
+        <div class="row">
+          <div>
+            <label>Select model:</label>
+            <select name="model" id="xModelSelect" required>${options}</select>
+            <div class="muted" id="xInvInfo" style="margin-top:6px;">Total: — | Unused: —</div>
+          </div>
+          <div>
+            <label>Number of X accounts you want</label>
+            <input type="number" name="count" min="1" value="10" required />
+          </div>
+        </div>
+        <button type="submit">Get X Usernames</button>
+      </form>
+      <div class="muted">Select model to see inventory counters instantly.</div>
+    </div>
+    <script>
+      const sel = document.getElementById('xModelSelect');
+      const info = document.getElementById('xInvInfo');
+      async function updateInv(){
+        const m = sel.value;
+        if(!m) return;
+        const r = await fetch('/x/inventory/'+encodeURIComponent(m));
+        const d = await r.json();
+        info.textContent = 'Total: '+d.total+' | Unused: '+d.unusedForModel;
+      }
+      sel.addEventListener('change', updateInv);
+      updateInv();
+    </script>`,
+    req
+  );
+  res.send(html);
+});
+
+app.post('/x/format', async (req, res) => {
+  const count = parseInt(req.body.count, 10);
+  const model = (req.body.model || 'Natalie').trim();
+  if (!count || count < 1) return res.status(400).send('Invalid form values');
+
+  const { usernames, ids } = await takeXUsernames(model, count);
+
+  // Format as one username per line
+  const formatted = usernames.join('\n');
+
+  // activity
+  const act = await ActivityX.create({
+    model,
+    va: req.session?.vaName || null,
+    accounts: count,
+    per_line: 1, // Always 1 per line for X
+    total_usernames: usernames.length,
+    username_ids: ids,
+  });
+
+  await logEvent({
+    action: 'format_take_x',
+    details: { model, requested_accounts: count, total_returned: usernames.length, activity_id: String(act._id) },
+    req,
+    actor_type: req.session?.vaName ? 'va' : 'user',
+  });
+
+  const inv = await fetchXInventoryCounts(model);
+
+  const html = renderPage(
+    'X Usernames Assigned',
+    `
+    <div class="notice">
+      <p>Model: <b>${model}</b></p>
+      <p>Requested: ${count}, Returned: ${usernames.length}</p>
+      <div class="kpi-pill">Total in X DB: ${inv.total}</div>
+      <div class="kpi-pill">Unused for ${model}: ${inv.unusedForModel}</div>
+    </div>
+
+    <label>X Usernames (one per line):</label>
+    <textarea id="xFormattedBox" readonly>${formatted}</textarea>
+    <div class="actions">
+      <button type="button" onclick="copyFrom('xFormattedBox')">Copy to clipboard</button>
+      <form action="/download" method="post">
+        <input type="hidden" name="data" value="${encodeURIComponent(formatted)}" />
+        <input type="hidden" name="filename" value="x_usernames_${model}.txt" />
+        <button type="submit">Download .txt</button>
+      </form>
+    </div>
+
+    <div class="muted" style="margin-top:10px;">Activity saved. You can revert it from the <a href="/x/revert">Revert</a> page.</div>
+
+    <p style="margin-top:14px;"><a href="/x/format">Back to Format & Take X</a></p>`,
+    req
+  );
+  res.send(html);
+});
+
+// X KPI Builder
+app.get('/x/kpi', async (req, res) => {
+  const models = await ModelX.find({}).sort({ name: 1 }).lean();
+  const options = models.length
+    ? `<option value="">All models</option>` + models.map(m => `<option>${m.name}</option>`).join('')
+    : `<option value="">All models</option><option>Natalie</option>`;
+
+  const html = renderPage(
+    'X KPI Builder',
+    `
+    <div class="card">
+      <h2>X KPI Builder</h2>
+      <form action="/x/kpi" method="post" class="row">
+        <div><label>From</label><input type="date" name="from" required/></div>
+        <div><label>To</label><input type="date" name="to" required/></div>
+        <div><label>Model</label><select name="model">${options}</select></div>
+        <div style="display:flex; align-items:end;"><button type="submit">Load X Activities</button></div>
+      </form>
+      <div class="muted">Pick a range, optionally filter by model, then select activities to add to totals.</div>
     </div>`,
     req
   );
   res.send(html);
 });
 
-// X KPI (placeholder for now)
-app.get('/x/kpi', (req, res) => {
+app.post('/x/kpi', async (req, res) => {
+  const { from, to, model = '' } = req.body;
+  const q = { ts: { $gte: new Date(from), $lte: new Date(to + 'T23:59:59.999Z') }, undone: false };
+  if (model) q.model = model;
+  const acts = await ActivityX.find(q).sort({ ts: -1 }).lean();
+
+  const rows = acts.map(a => `
+    <tr>
+      <td><input type="checkbox" name="pick" value="${a._id}" data-a="${a.accounts}" data-total="${a.total_usernames}"/></td>
+      <td>${new Date(a.ts).toLocaleString()}</td>
+      <td>${a.va || '—'}</td>
+      <td>${a.model}</td>
+      <td>Accounts=${a.accounts}</td>
+      <td>Total=${a.total_usernames}</td>
+    </tr>`).join('');
+
   const html = renderPage(
-    'X KPI',
+    'X KPI Builder',
     `
     <div class="card">
-      <h2>X KPI</h2>
-      <p class="muted">This functionality will be implemented later. For now, this is a placeholder.</p>
-      <div class="actions">
-        <a href="/x/add">Import X Usernames</a>
-        <a href="/x/format">Format & Take X</a>
-        <a href="/x/admin">X Admin Panel</a>
+      <div class="actions" style="margin-bottom:8px;">
+        <button type="button" onclick="selectAll(true)">Select all</button>
+        <button type="button" onclick="selectAll(false)">Clear</button>
       </div>
+      <table>
+        <thead><tr><th></th><th>Date</th><th>VA</th><th>Model</th><th>Accounts</th><th>Total Usernames</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="6">No X activities in range.</td></tr>'}</tbody>
+      </table>
+      <div class="notice" style="margin-top:10px;">
+        <div id="xKpiOut">Accounts=0; Total Usernames=0</div>
+      </div>
+      <script>
+        function recalc(){
+          let A=0, T=0;
+          document.querySelectorAll('input[name=pick]:checked').forEach(cb=>{
+            A += parseInt(cb.dataset.a,10);
+            T += parseInt(cb.dataset.total,10);
+          });
+          document.getElementById('xKpiOut').innerText = 'Accounts='+A+'; Total Usernames='+T;
+        }
+        function selectAll(v){
+          document.querySelectorAll('input[name=pick]').forEach(cb => { cb.checked=v; });
+          recalc();
+        }
+        document.querySelectorAll('input[name=pick]').forEach(cb=>cb.addEventListener('change', recalc));
+      </script>
+    </div>
+    <p><a href="/x/kpi">Back to X KPI</a></p>`,
+    req
+  );
+  res.send(html);
+});
+
+// X Revert last actions (per VA shows their own 10)
+app.get('/x/revert', async (req, res) => {
+  const who = req.session?.vaName;
+  const query = who ? { va: who, undone: false } : { undone: false };
+  const acts = await ActivityX.find(query).sort({ ts: -1 }).limit(10).lean();
+  const rows = acts.map(a => `
+    <tr>
+      <td>${new Date(a.ts).toLocaleString()}</td>
+      <td>${a.va || '—'}</td>
+      <td>${a.model}</td>
+      <td>Accounts=${a.accounts}, Total=${a.total_usernames}</td>
+      <td>
+        <form action="/x/revert" method="post" onsubmit="return confirm('Revert this X activity?');">
+          <input type="hidden" name="id" value="${a._id}" />
+          <button class="danger">Revert</button>
+        </form>
+      </td>
+    </tr>`).join('');
+  const html = renderPage(
+    'Revert Last X Actions',
+    `
+    <div class="card">
+      <div class="muted">Showing ${acts.length} recent X activities ${who ? `(for VA: ${who})` : '(all users)'}</div>
+      <table>
+        <thead><tr><th>Date</th><th>VA</th><th>Model</th><th>Counts</th><th>Action</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="5">No recent X activities.</td></tr>'}</tbody>
+      </table>
     </div>`,
     req
   );
   res.send(html);
+});
+
+app.post('/x/revert', async (req, res) => {
+  const id = (req.body.id || '').trim();
+  const act = await ActivityX.findById(id);
+  if (!act || act.undone) return res.redirect('/x/revert');
+
+  await UsernameX.updateMany({ _id: { $in: act.username_ids } }, { $pull: { used_by: act.model } });
+  act.undone = true; await act.save();
+
+  await logEvent({ action: 'revert_x_activity', details: { activity_id: id, model: act.model, total_usernames: act.total_usernames }, req, actor_type: req.session?.vaName ? 'va' : 'user' });
+
+  res.redirect('/x/revert');
 });
 
 // X Admin Panel
