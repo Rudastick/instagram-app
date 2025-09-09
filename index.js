@@ -30,8 +30,7 @@ const {
   NODE_ENV = 'development',
 } = process.env;
 
-const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
-const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi.com';
+// External IG scraping moved into the BlueMagic extension; no external API keys needed here
 
 const IS_PROD = NODE_ENV === 'production';
 
@@ -65,37 +64,7 @@ app.use(
 // Static for branding
 app.use('/static', express.static(path.join(__dirname, 'static')));
 
-// Scrape jobs (in-memory per-process)
-const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc, stats, stopped }
-global.activeScrapeJob = null; // Only one active job at a time
-
-// Performance monitoring
-const performanceStats = {
-  totalRequests: 0,
-  successfulRequests: 0,
-  failedRequests: 0,
-  cacheHits: 0,
-  duplicatesRemoved: 0,
-  startTime: null,
-  lastRequestTime: null
-};
-
-// Request cache with TTL
-const requestCache = new Map();
-const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
-
-// Cache cleanup function
-function cleanupCache() {
-  const now = Date.now();
-  for (const [key, value] of requestCache.entries()) {
-    if (now - value.timestamp > CACHE_TTL) {
-      requestCache.delete(key);
-    }
-  }
-}
-
-// Run cache cleanup every minute
-setInterval(cleanupCache, 60000);
+// Scrape state and caches removed — handled by extension now
 
 // Multer for .txt uploads
 const upload = multer({ storage: multer.memoryStorage() });
@@ -251,8 +220,6 @@ function renderPage(title, content, req) {
     } else if (isManagement(req)) {
       nav = `<nav>
         <a href="/add">Import</a>
-        <a href="/format">Format & Take</a>
-        <a href="/scrape">Scrape & Format IG</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/mass-follow-formatter">Mass follow formatter</a>
@@ -262,8 +229,6 @@ function renderPage(title, content, req) {
     } else if (isAdmin(req)) {
       nav = `<nav>
         <a href="/add">Import</a>
-        <a href="/format">Format & Take</a>
-        <a href="/scrape">Scrape & Format IG</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin</a>
@@ -340,126 +305,11 @@ async function logEvent({ action, details = {}, req, actor_type = 'user' }) {
   } catch (e) { console.error('Log error:', e); }
 }
 
-// ---- IG Scraper helpers ----
-if (!RAPIDAPI_KEY) console.warn('WARNING: RAPIDAPI_KEY missing – /scrape will fail until set.');
-
-const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-function pickProfile(payload) {
-  if (payload && typeof payload === 'object') {
-    if (payload.data && typeof payload.data === 'object') return payload.data;
-    if (payload.profile && typeof payload.profile === 'object') return payload.profile;
-  }
-  return payload;
-}
-
-async function fetchProfile(username, retries = 3) {
-  performanceStats.totalRequests++;
-  performanceStats.lastRequestTime = Date.now();
-
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const url = `https://${RAPIDAPI_HOST}/profile2?username=${encodeURIComponent(username)}`;
-      console.log(`Fetching profile for ${username} (attempt ${attempt}/${retries})`);
-      
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 second timeout
-      
-      const res = await fetch(url, {
-        headers: {
-          'x-rapidapi-host': RAPIDAPI_HOST,
-          'x-rapidapi-key': RAPIDAPI_KEY
-        },
-        signal: controller.signal
-      });
-      
-      clearTimeout(timeoutId);
-      
-      console.log(`Response status: ${res.status} for ${username}`);
-      
-      if (!res.ok) {
-        if (res.status === 429) { // Rate limited
-          const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
-          console.log(`Rate limited for ${username}, waiting ${delay}ms`);
-          await sleep(delay);
-          continue;
-        }
-        throw new Error(`HTTP ${res.status}: ${res.statusText}`);
-      }
-
-      const text = await res.text();
-      let json;
-      try { 
-        json = JSON.parse(text); 
-      } catch (e) {
-        console.log(`JSON parse error for ${username}: ${text.slice(0,120)}`);
-        throw new Error(`Non-JSON: ${text.slice(0,120)}`);
-      }
-      
-      // Check if the response indicates success
-      if (json.status === false) {
-        throw new Error(json.errorMessage || 'API returned status: false');
-      }
-      
-      const p = pickProfile(json);
-      if (!p || typeof p !== 'object') {
-        console.log(`No profile object for ${username}:`, json);
-        throw new Error('No profile object');
-      }
-
-      console.log(`Successfully fetched profile for ${username}`);
-      performanceStats.successfulRequests++;
-      return p;
-      
-    } catch (error) {
-      console.log(`Error fetching ${username} (attempt ${attempt}):`, error.message);
-      if (attempt === retries) {
-        performanceStats.failedRequests++;
-        throw error;
-      }
-      
-      // Exponential backoff with jitter
-      const delay = Math.min(1000 * Math.pow(2, attempt - 1) + Math.random() * 1000, 10000);
-      console.log(`Retrying ${username} in ${delay}ms`);
-      await sleep(delay);
-    }
-  }
-}
-
-// Map API → Airtable-style CSV (Username first)
-function mapToCsvRow(p, inputUsername) {
-  const media_count =
-    p.media_count ??
-    p.edge_owner_to_timeline_media?.count ??
-    p.timeline_media_count ?? null;
-
-  const followers =
-    p.follower_count ??
-    p.followers_count ??
-    p.edge_followed_by?.count ?? null;
-
-  const following =
-    p.following_count ??
-    p.edge_follow?.count ?? null;
-
-  const bioLinksArr = Array.isArray(p.bio_links) ? p.bio_links : [];
-  const linkInBio = bioLinksArr.length > 0;
-  const isPrivate = !!(p.is_private);
-
-  return {
-    'Username': inputUsername,
-    'Name': p.full_name || p.fullName || p.name || '',
-    'Media Count': media_count == null ? null : Number(media_count),
-    'Followers Ordered': followers == null ? null : Number(followers),
-    'Followers': followers == null ? null : Number(followers),
-    'Following': following == null ? null : Number(following),
-    'Link in bio?': linkInBio ? 'TRUE' : 'FALSE',
-    'Private?': isPrivate ? 'TRUE' : 'FALSE'
-  };
-}
+// Scraper helpers removed; handled in extension
 
 // ===== Scrape & Format IG (new) =====
-app.get('/scrape', (req, res) => {
+/* Scrape routes removed: moved into BlueMagic extension */
+/* app.get('/scrape', (req, res) => {
   const html = renderPage(
     'Scrape & Format IG',
     `
@@ -616,177 +466,9 @@ app.get('/scrape', (req, res) => {
     req
   );
   res.send(html);
-});
+}); */
 
-app.post('/scrape/start', upload.single('file'), async (req, res) => {
-  try {
-    // Check if there's already an active job
-    if (global.activeScrapeJob) {
-      return res.json({ ok:false, error:'A scraping task is already running. Please wait for it to complete or stop it first.' });
-    }
-
-    if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
-    
-    const delay = Math.max(0, parseInt(req.body.delay || '100', 10));
-    const conc = Math.max(1, Math.min(parseInt(req.body.conc || '4', 10), 8));
-    const retries = Math.max(1, Math.min(parseInt(req.body.retries || '3', 10), 5));
-
-    const content = req.file.buffer.toString('utf8');
-    const usernames = content.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
-    if (!usernames.length) return res.json({ ok:false, error:'Empty file' });
-
-    // Reset performance stats
-    performanceStats.totalRequests = 0;
-    performanceStats.successfulRequests = 0;
-    performanceStats.failedRequests = 0;
-    performanceStats.cacheHits = 0;
-    performanceStats.duplicatesRemoved = 0;
-    performanceStats.startTime = Date.now();
-    performanceStats.lastRequestTime = null;
-
-    const jobId = crypto.randomBytes(8).toString('hex');
-    const job = { 
-      total: usernames.length, 
-      done: 0, 
-      start: Date.now(), 
-      rows: [], 
-      status: 'running', 
-      error: null, 
-      delay, 
-      conc, 
-      retries,
-      stopped: false,
-      stats: {
-        successfulRequests: 0,
-        failedRequests: 0,
-        cacheHits: 0,
-        duplicatesRemoved: 0,
-        totalRequests: 0,
-        elapsedTime: 0
-      }
-    };
-    
-    scrapeJobs.set(jobId, job);
-    global.activeScrapeJob = jobId; // Set active job
-
-    // background worker
-    (async () => {
-      const queue = usernames.slice();
-      const workers = new Array(job.conc).fill(0).map(async () => {
-        while (queue.length && !job.stopped) {
-          const u = queue.shift();
-          if (job.stopped) break;
-          
-          try {
-            const p = await fetchProfile(u, job.retries);
-            const row = mapToCsvRow(p, u);
-            job.rows.push(row);
-            job.stats.successfulRequests++;
-          } catch (e) {
-            job.rows.push({
-              'Username': u, 'Name':'', 'Media Count':null, 'Followers Ordered':null, 'Followers':null, 'Following':null, 'Link in bio?':'FALSE', 'Private?':'FALSE', _error: e.message
-            });
-            job.stats.failedRequests++;
-          } finally {
-            job.done++;
-            job.stats.totalRequests = performanceStats.totalRequests;
-            job.stats.cacheHits = performanceStats.cacheHits;
-            job.stats.elapsedTime = (Date.now() - job.start) / 1000;
-            
-            if (job.delay && !job.stopped) await sleep(job.delay);
-          }
-        }
-      });
-
-      try {
-        await Promise.all(workers);
-        if (job.stopped) {
-          job.status = 'stopped';
-        } else {
-          job.status = 'done';
-        }
-      } catch (e) {
-        job.status = 'error';
-        job.error = e.message;
-      } finally {
-        global.activeScrapeJob = null; // Clear active job
-      }
-    })();
-
-    res.json({ ok:true, jobId });
-  } catch (e) {
-    res.json({ ok:false, error:e.message });
-  }
-});
-
-app.get('/scrape/status', (req, res) => {
-  const id = (req.query.job || '').trim();
-  const job = scrapeJobs.get(id);
-  if (!job) return res.json({ ok:false, error:'job not found' });
-  
-  const elapsed = (Date.now() - job.start) / 1000;
-  const rate = job.done > 0 ? job.done / elapsed : 0;
-  const remaining = Math.max(0, job.total - job.done);
-  const eta_s = rate > 0 ? remaining / rate : null;
-  
-  // Update job stats
-  job.stats.elapsedTime = elapsed;
-  job.stats.totalRequests = performanceStats.totalRequests;
-  job.stats.cacheHits = performanceStats.cacheHits;
-  
-  res.json({ 
-    ok:true, 
-    status: job.status, 
-    done: job.done, 
-    total: job.total, 
-    eta_s, 
-    error: job.error || null,
-    stats: job.stats
-  });
-});
-
-// Check if there's an active scraping job
-app.get('/scrape/active', (req, res) => {
-  res.json({ 
-    active: !!global.activeScrapeJob,
-    jobId: global.activeScrapeJob || null
-  });
-});
-
-// Stop an active scraping job
-app.post('/scrape/stop', (req, res) => {
-  const id = (req.query.job || '').trim();
-  const job = scrapeJobs.get(id);
-  if (!job) return res.json({ ok:false, error:'job not found' });
-  
-  if (job.status === 'running') {
-    job.stopped = true;
-    job.status = 'stopped';
-    global.activeScrapeJob = null;
-    res.json({ ok:true, message:'Scraping stopped' });
-  } else {
-    res.json({ ok:false, error:'Job is not running' });
-  }
-});
-
-app.get('/scrape/download', (req, res) => {
-  const id = (req.query.job || '').trim();
-  const job = scrapeJobs.get(id);
-  if (!job || (job.status !== 'done' && job.status !== 'stopped')) {
-    return res.status(404).send('Job not ready');
-  }
-
-  const fields = ['Username','Name','Media Count','Followers Ordered','Followers','Following','Link in bio?','Private?'];
-  const example = job.rows.find(r => Object.keys(r).some(k => k.startsWith('_'))) || {};
-  const extra = Object.keys(example).filter(k => !fields.includes(k));
-  const parser = new Parser({ fields: fields.concat(extra) });
-
-  const csv = parser.parse(job.rows);
-  const statusSuffix = job.status === 'stopped' ? '_partial' : '';
-  res.setHeader('Content-Disposition', `attachment; filename="profiles${statusSuffix}_${Date.now()}.csv"`);
-  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-  res.send(csv);
-});
+// /scrape* routes removed
 // ===== Auth middleware =====
 
 
@@ -825,39 +507,7 @@ app.use((req, res, next) => {
 app.get('/health', (_req, res) => res.send('ok'));
 
 // ===== API Health Check =====
-app.get('/api-health', async (_req, res) => {
-  try {
-    const url = `https://${RAPIDAPI_HOST}/profile?username=instagram`;
-    const response = await fetch(url, {
-      headers: {
-        'x-rapidapi-host': RAPIDAPI_HOST,
-        'x-rapidapi-key': RAPIDAPI_KEY
-      }
-    });
-    
-    const text = await response.text();
-    const isJson = text.trim().startsWith('{') || text.trim().startsWith('[');
-    const isHtml = text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html');
-    
-    res.json({
-      status: response.ok ? 'ok' : 'error',
-      httpStatus: response.status,
-      contentType: response.headers.get('content-type'),
-      isJson,
-      isHtml,
-      responsePreview: text.slice(0, 200),
-      apiKeyConfigured: !!RAPIDAPI_KEY,
-      apiHost: RAPIDAPI_HOST
-    });
-  } catch (error) {
-    res.json({
-      status: 'error',
-      error: error.message,
-      apiKeyConfigured: !!RAPIDAPI_KEY,
-      apiHost: RAPIDAPI_HOST
-    });
-  }
-});
+// API health check removed; handled by extension
 
 // ===== Login (single field supports Admin/VA/User) =====
 app.get('/login', (req, res) => {
@@ -1070,8 +720,6 @@ app.get('/add', (req, res) => {
         <button type="submit">Import Usernames</button>
       </form>
       <div class="actions">
-        <a href="/format">Format & Take</a>
-        <a href="/scrape">Scrape & Format IG</a>
         <a href="/revert">Revert</a>
         <a href="/kpi">KPI</a>
         <a href="/admin">Admin panel</a>
@@ -1123,7 +771,7 @@ app.post('/add', upload.single('file'), async (req, res) => {
       <p>Detected ${duplicates} duplicates.</p>
     </div>
     <p><a href="/add">Back to Import</a></p>
-    <p><a href="/format">Go to Format & Take Usernames</a></p>`,
+    `,
     req
   );
   res.send(html);
@@ -1199,26 +847,7 @@ app.get('/mass-follow-formatter', (req, res) => {
 });
 
 
-// ===== Format & Take =====
-async function fetchInventoryCounts(model) {
-  const total = await Username.countDocuments({});
-  const unusedForModel = await Username.countDocuments({ used_by: { $ne: model } });
-  return { total, unusedForModel };
-}
-async function takeUsernames(model, takeCount) {
-  const docs = await Username.find({ used_by: { $ne: model } })
-    .sort({ date_added: -1 })
-    .limit(takeCount)
-    .lean();
-  const ids = docs.map(d => d._id);
-  if (ids.length) {
-    await Username.updateMany(
-      { _id: { $in: ids } },
-      { $addToSet: { used_by: model }, $set: { last_used_at: new Date(), last_used_by: model } }
-    );
-  }
-  return { usernames: docs.map(d => d.username), ids };
-}
+// IG format helpers removed — handled by extension
 
 // X Format & Take helpers
 async function fetchXInventoryCounts(model) {
@@ -1242,129 +871,7 @@ async function takeXUsernames(model, takeCount) {
   return { usernames: docs.map(d => d.username), ids };
 }
 
-app.get('/format', async (req, res) => {
-  const models = await Model.find({}).sort({ name: 1 }).lean();
-  const options = models.length
-    ? models.map(m => `<option value="${m.name}">${m.name}</option>`).join('')
-    : `<option value="Natalie">Natalie</option>`;
-
-  const html = renderPage(
-    'Format & Take Usernames',
-    `
-    <div class="card">
-      <form action="/format" method="post" id="formatForm">
-        <div class="row">
-          <div>
-            <label>Select model:</label>
-            <select name="model" id="modelSelect" required>${options}</select>
-            <div class="muted" id="invInfo" style="margin-top:6px;">Total: — | Unused: —</div>
-          </div>
-          <div>
-            <label>Number of accounts performing the follow task (A)</label>
-            <input type="number" name="count" min="1" value="10" required />
-          </div>
-        </div>
-        <div class="row">
-          <div>
-            <label>Number of usernames per line</label>
-            <input type="number" name="perLine" min="1" value="10" required />
-          </div>
-          <div>
-            <label>Total = A × B</label>
-            <input type="text" id="calcBox" value="Calculated after submit" disabled />
-          </div>
-        </div>
-        <button type="submit">Format and Preview</button>
-      </form>
-      <div class="muted">Select model to see inventory counters instantly.</div>
-    </div>
-    <script>
-      const sel = document.getElementById('modelSelect');
-      const info = document.getElementById('invInfo');
-      const form = document.getElementById('formatForm');
-      const a = form.querySelector('input[name="count"]');
-      const b = form.querySelector('input[name="perLine"]');
-      const calc = document.getElementById('calcBox');
-      function updateCalc(){ const A=parseInt(a.value||'0',10), B=parseInt(b.value||'0',10); if(A>0&&B>0) calc.value = (A*B)+' usernames'; }
-      a.addEventListener('input', updateCalc); b.addEventListener('input', updateCalc);
-      async function updateInv(){
-        const m = sel.value;
-        if(!m) return;
-        const r = await fetch('/inventory/'+encodeURIComponent(m));
-        const d = await r.json();
-        info.textContent = 'Total: '+d.total+' | Unused: '+d.unusedForModel;
-      }
-      sel.addEventListener('change', updateInv);
-      updateInv();
-    </script>`,
-    req
-  );
-  res.send(html);
-});
-
-app.post('/format', async (req, res) => {
-  const count = parseInt(req.body.count, 10);
-  const perLine = parseInt(req.body.perLine, 10);
-  const model = (req.body.model || 'Natalie').trim();
-  if (!count || !perLine || count < 1 || perLine < 1) return res.status(400).send('Invalid form values');
-
-  const totalToFetch = count * perLine;
-  const { usernames, ids } = await takeUsernames(model, totalToFetch);
-
-  // group into B per line
-  const lines = [];
-  for (let i = 0; i < usernames.length; i += perLine) {
-    lines.push(usernames.slice(i, i + perLine).join(','));
-  }
-  const formatted = lines.join('\n');
-
-  // activity
-  const act = await Activity.create({
-    model,
-    va: req.session?.vaName || null,
-    accounts: count,
-    per_line: perLine,
-    total_usernames: usernames.length,
-    username_ids: ids,
-  });
-
-  await logEvent({
-    action: 'format_take',
-    details: { model, requested_accounts: count, per_line: perLine, total_requested: totalToFetch, total_returned: usernames.length, activity_id: String(act._id) },
-    req,
-    actor_type: req.session?.vaName ? 'va' : 'user',
-  });
-
-  const inv = await fetchInventoryCounts(model);
-
-  const html = renderPage(
-    'Formatted Usernames',
-    `
-    <div class="notice">
-      <p>Model: <b>${model}</b></p>
-      <p>A=${count} • B=${perLine} ⇒ Requested: ${totalToFetch}, Returned: ${usernames.length}</p>
-      <div class="kpi-pill">Total in DB: ${inv.total}</div>
-      <div class="kpi-pill">Unused for ${model}: ${inv.unusedForModel}</div>
-    </div>
-
-    <label>Preview:</label>
-    <textarea id="formattedBox" readonly>${formatted}</textarea>
-    <div class="actions">
-      <button type="button" onclick="copyFrom('formattedBox')">Copy to clipboard</button>
-      <form action="/download" method="post">
-        <input type="hidden" name="data" value="${encodeURIComponent(formatted)}" />
-        <input type="hidden" name="filename" value="usernames_${model}.txt" />
-        <button type="submit">Download .txt</button>
-      </form>
-    </div>
-
-    <div class="muted" style="margin-top:10px;">Activity saved. You can revert it from the <a href="/revert">Revert</a> page.</div>
-
-    <p style="margin-top:14px;"><a href="/format">Back to Format & Take</a></p>`,
-    req
-  );
-  res.send(html);
-});
+// /format routes removed — handled by extension
 
 // Download file
 app.post('/download', (req, res) => {
