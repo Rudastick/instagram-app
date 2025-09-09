@@ -383,6 +383,10 @@ async function fetchProfile(username, retries = 3) {
       try { 
         json = JSON.parse(text); 
       } catch (e) {
+        // Check if response is HTML (common with API errors)
+        if (text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html')) {
+          throw new Error(`API returned HTML instead of JSON. This usually means the API endpoint is blocked or your API key is invalid. Response: ${text.slice(0,200)}`);
+        }
         throw new Error(`Invalid JSON response: ${text.slice(0,120)}`);
       }
       
@@ -468,6 +472,41 @@ app.use((req, res, next) => {
 
 // ===== Health =====
 app.get('/health', (_req, res) => res.send('ok'));
+
+// ===== API Health Check =====
+app.get('/api-health', async (_req, res) => {
+  try {
+    const url = `https://${RAPIDAPI_HOST}/profile?username=instagram`;
+    const response = await fetch(url, {
+      headers: {
+        'x-rapidapi-host': RAPIDAPI_HOST,
+        'x-rapidapi-key': RAPIDAPI_KEY
+      }
+    });
+    
+    const text = await response.text();
+    const isJson = text.trim().startsWith('{') || text.trim().startsWith('[');
+    const isHtml = text.trim().startsWith('<!DOCTYPE') || text.trim().startsWith('<html');
+    
+    res.json({
+      status: response.ok ? 'ok' : 'error',
+      httpStatus: response.status,
+      contentType: response.headers.get('content-type'),
+      isJson,
+      isHtml,
+      responsePreview: text.slice(0, 200),
+      apiKeyConfigured: !!RAPIDAPI_KEY,
+      apiHost: RAPIDAPI_HOST
+    });
+  } catch (error) {
+    res.json({
+      status: 'error',
+      error: error.message,
+      apiKeyConfigured: !!RAPIDAPI_KEY,
+      apiHost: RAPIDAPI_HOST
+    });
+  }
+});
 
 // ===== Login (single field supports Admin/VA/User) =====
 app.get('/login', (req, res) => {
