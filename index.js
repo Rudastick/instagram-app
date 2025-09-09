@@ -1197,7 +1197,7 @@ app.get('/scrape', (req, res) => {
     </div>
 
 
-    <div class="card">
+    <div class="card" id="progressCard" style="display:none;">
       <label>Progress</label>
       <div id="bar" style="height:16px;background:#0f172f;border:1px solid #223064;border-radius:8px;overflow:hidden;">
         <div id="fill" style="height:100%;width:0%;background:linear-gradient(90deg,#6a0dad,#52118e);"></div>
@@ -1217,6 +1217,7 @@ app.get('/scrape', (req, res) => {
       const rateInfo = document.getElementById('rateInfo');
       const cancelBtn = document.getElementById('cancelBtn');
       const clearAllBtn = document.getElementById('clearAllBtn');
+      const progressCard = document.getElementById('progressCard');
 
       // Calculate and display current rate
       function updateRateInfo() {
@@ -1248,6 +1249,7 @@ app.get('/scrape', (req, res) => {
               cancelBtn.style.display = 'none';
               fill.style.width = '0%';
               meta.textContent = 'Job cancelled';
+              progressCard.style.display = 'none'; // Hide progress card
               alert('Job cancelled successfully');
             } else {
               alert('Failed to cancel job: ' + result.error);
@@ -1270,6 +1272,7 @@ app.get('/scrape', (req, res) => {
               fill.style.width = '0%';
               meta.textContent = 'All jobs cleared and API reset';
               doneBox.style.display = 'none';
+              progressCard.style.display = 'none'; // Hide progress card
               alert('All jobs cleared and API cache reset successfully!');
             } else {
               alert('Failed to clear jobs: ' + result.error);
@@ -1286,6 +1289,7 @@ app.get('/scrape', (req, res) => {
           const response = await fetch('/scrape/active');
           const result = await response.json();
           if (result.ok && result.active) {
+            progressCard.style.display = 'block'; // Show progress card
             cancelBtn.style.display = 'inline-block';
             meta.textContent = 'Active job: ' + result.progress + ' (' + result.percentage + '%)';
             fill.style.width = result.percentage + '%';
@@ -1298,6 +1302,7 @@ app.get('/scrape', (req, res) => {
 
       form.addEventListener('submit', async (e)=>{
         e.preventDefault();
+        progressCard.style.display = 'block'; // Show progress card when starting
         doneBox.style.display = 'none';
         fill.style.width = '0%';
         meta.textContent = '0%';
@@ -1306,7 +1311,11 @@ app.get('/scrape', (req, res) => {
         const fd = new FormData(form);
         const r = await fetch('/scrape/start', { method:'POST', body: fd });
         const j = await r.json();
-        if(!j.ok){ alert('Error: '+(j.error||'unknown')); return; }
+        if(!j.ok){ 
+          progressCard.style.display = 'none'; // Hide progress card on error
+          alert('Error: '+(j.error||'unknown')); 
+          return; 
+        }
 
         const job = j.jobId;
 
@@ -1355,11 +1364,13 @@ app.get('/scrape', (req, res) => {
             dl.href = '/scrape/download?job='+encodeURIComponent(job);
             doneBox.style.display = 'block';
             cancelBtn.style.display = 'none'; // Hide cancel button when done
+            // Keep progress card visible when done to show download link
           }
           if(s.status==='error'){
             clearInterval(timer);
             alert('Scrape failed: '+s.error);
             cancelBtn.style.display = 'none'; // Hide cancel button on error
+            progressCard.style.display = 'none'; // Hide progress card on error
           }
         }, 600);
       });
@@ -1378,10 +1389,10 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
     // Check if there's already an active scraping job
     if (activeScrapeJob) {
       const existingJob = scrapeJobs.get(activeScrapeJob);
-      if (existingJob && existingJob.status === 'running') {
+      if (existingJob && (existingJob.status === 'running' || existingJob.status === 'cancelled')) {
         return res.json({ 
           ok: false, 
-          error: `Another scraping job is already running (${existingJob.done}/${existingJob.total} completed). Please wait for it to finish or refresh the page to cancel it.` 
+          error: `Another scraping job is already running (${existingJob.done}/${existingJob.total} completed). Please wait for it to finish or use "Clear All Jobs" to cancel it.` 
         });
       }
     }
@@ -1531,7 +1542,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
         // Filter out undefined results and assign to job.rows
         job.rows = results.filter(row => row !== undefined);
         job.status = 'done';
-        activeScrapeJob = null; // Mark as completed
+        activeScrapeJob = null; // Clear active job reference when completed
         
         // Log performance statistics
         const duration = (Date.now() - job.start) / 1000;
@@ -1543,7 +1554,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       } catch (e) {
         job.status = 'error';
         job.error = e.message;
-        activeScrapeJob = null; // Mark as completed even on error
+        activeScrapeJob = null; // Clear active job reference even on error
         console.error('Scraping job failed:', e);
       }
     })();
@@ -1615,7 +1626,7 @@ app.post('/scrape/cancel', (req, res) => {
       job.status = 'cancelled';
       job.error = 'Cancelled by user';
       jobCancelled = true; // Set flag to stop background processing
-      activeScrapeJob = null;
+      activeScrapeJob = null; // Clear active job reference
       console.log('Scraping job cancelled by user');
       res.json({ ok: true, message: 'Job cancelled' });
     } else {
@@ -1644,7 +1655,7 @@ app.post('/scrape/clear-all', (req, res) => {
   
   // Clear all jobs
   scrapeJobs.clear();
-  activeScrapeJob = null;
+  activeScrapeJob = null; // Clear active job reference
   jobCancelled = true; // Set flag to stop any remaining background processing
   
   // Clear rate limiter queue and reset active requests
