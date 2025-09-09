@@ -69,12 +69,9 @@ app.use('/static', express.static(path.join(__dirname, 'static')));
 // Scrape jobs (in-memory per-process)
 const scrapeJobs = new Map(); // jobId -> { total, done, start, rows, status, error, delay, conc }
 
-// Test run jobs (in-memory per-process)
-const testJobs = new Map(); // testId -> { status, completed, totalTests, results, error }
-
 // Active job tracking (prevent multiple simultaneous jobs)
 let activeScrapeJob = null;
-let activeTestJob = null;
+let jobCancelled = false; // Flag to stop background processing
 
 // Clean up old jobs periodically
 setInterval(() => {
@@ -89,13 +86,6 @@ setInterval(() => {
     }
   }
   
-  // Clean up old test jobs
-  for (const [testId, job] of testJobs.entries()) {
-    if (now - job.start > maxAge) {
-      testJobs.delete(testId);
-      if (activeTestJob === testId) activeTestJob = null;
-    }
-  }
 }, 5 * 60 * 1000); // Check every 5 minutes
 
 // Multer for .txt uploads
@@ -1073,29 +1063,12 @@ app.get('/scrape', (req, res) => {
         </div>
         <div class="actions">
           <button type="submit">Start Scrape</button>
-          <button type="button" id="testRunBtn" style="background: linear-gradient(180deg,#28a745,#1e7e34);">Test Run (Find Best Settings)</button>
           <button type="button" id="cancelBtn" style="background: linear-gradient(180deg,#dc3545,#c82333); display:none;">Cancel Current Job</button>
+          <button type="button" id="clearAllBtn" style="background: linear-gradient(180deg,#6c757d,#5a6268);">Clear All Jobs & Reset API</button>
         </div>
       </form>
     </div>
 
-    <div class="card" id="testResults" style="display:none;">
-      <label>Test Run Results</label>
-      <div id="testStatus" class="muted">Running tests...</div>
-      <div id="testProgress" style="height:8px;background:#0f172f;border:1px solid #223064;border-radius:4px;overflow:hidden;margin:8px 0;">
-        <div id="testFill" style="height:100%;width:0%;background:linear-gradient(90deg,#28a745,#1e7e34);"></div>
-      </div>
-      <div id="optimalSettings" style="display:none;">
-        <div class="notice" style="margin-top:10px;">
-          <h4>🎯 Recommended Settings:</h4>
-          <p><strong>Delay:</strong> <span id="optDelay">-</span>ms</p>
-          <p><strong>Concurrency:</strong> <span id="optConc">-</span></p>
-          <p><strong>Expected Speed:</strong> <span id="optSpeed">-</span> requests/second</p>
-          <p><strong>Success Rate:</strong> <span id="optSuccess">-</span>%</p>
-          <button type="button" onclick="applyOptimalSettings()" style="background: linear-gradient(180deg,#28a745,#1e7e34); margin-top:8px;">Apply These Settings</button>
-        </div>
-      </div>
-    </div>
 
     <div class="card">
       <label>Progress</label>
@@ -1114,13 +1087,9 @@ app.get('/scrape', (req, res) => {
       const meta = document.getElementById('meta');
       const doneBox = document.getElementById('doneBox');
       const dl = document.getElementById('dl');
-      const testRunBtn = document.getElementById('testRunBtn');
-      const testResults = document.getElementById('testResults');
-      const testStatus = document.getElementById('testStatus');
-      const testFill = document.getElementById('testFill');
-      const optimalSettings = document.getElementById('optimalSettings');
       const rateInfo = document.getElementById('rateInfo');
       const cancelBtn = document.getElementById('cancelBtn');
+      const clearAllBtn = document.getElementById('clearAllBtn');
 
       // Calculate and display current rate
       function updateRateInfo() {
@@ -1150,12 +1119,36 @@ app.get('/scrape', (req, res) => {
             const result = await response.json();
             if (result.ok) {
               cancelBtn.style.display = 'none';
+              fill.style.width = '0%';
+              meta.textContent = 'Job cancelled';
               alert('Job cancelled successfully');
             } else {
               alert('Failed to cancel job: ' + result.error);
             }
           } catch (error) {
             alert('Error cancelling job: ' + error.message);
+          }
+        }
+      });
+
+      // Clear all jobs button functionality
+      clearAllBtn.addEventListener('click', async () => {
+        if (confirm('Are you sure you want to clear ALL jobs and reset the API cache? This will stop any running jobs and clear all cached data.')) {
+          try {
+            const response = await fetch('/scrape/clear-all', { method: 'POST' });
+            const result = await response.json();
+            if (result.ok) {
+              // Reset UI
+              cancelBtn.style.display = 'none';
+              fill.style.width = '0%';
+              meta.textContent = 'All jobs cleared and API reset';
+              doneBox.style.display = 'none';
+              alert('All jobs cleared and API cache reset successfully!');
+            } else {
+              alert('Failed to clear jobs: ' + result.error);
+            }
+          } catch (error) {
+            alert('Error clearing jobs: ' + error.message);
           }
         }
       });
@@ -1227,115 +1220,6 @@ app.get('/scrape', (req, res) => {
         }, 600);
       });
 
-      // Test Run functionality
-      testRunBtn.addEventListener('click', async (e) => {
-        e.preventDefault();
-        
-        const fileInput = form.querySelector('input[name="file"]');
-        if (!fileInput.files[0]) {
-          alert('Please upload a .txt file first');
-          return;
-        }
-
-        testResults.style.display = 'block';
-        testStatus.textContent = 'Starting test run...';
-        testFill.style.width = '0%';
-        optimalSettings.style.display = 'none';
-        testRunBtn.disabled = true;
-        testRunBtn.textContent = 'Testing...';
-
-        try {
-          const fd = new FormData();
-          fd.append('file', fileInput.files[0]);
-          fd.append('testMode', 'true');
-
-          const response = await fetch('/scrape/test-run', { 
-            method: 'POST', 
-            body: fd 
-          });
-          const result = await response.json();
-
-          if (!result.ok) {
-            throw new Error(result.error || 'Test run failed');
-          }
-
-          const testId = result.testId;
-          await runTest(testId);
-
-        } catch (error) {
-          testStatus.textContent = 'Test failed: ' + error.message;
-          testRunBtn.disabled = false;
-          testRunBtn.textContent = 'Test Run (Find Best Settings)';
-        }
-      });
-
-      async function runTest(testId) {
-        const testTimer = setInterval(async () => {
-          try {
-            const response = await fetch('/scrape/test-status?testId=' + encodeURIComponent(testId));
-            const status = await response.json();
-
-            if (!status.ok) {
-              throw new Error(status.error || 'Test status failed');
-            }
-
-            const progress = status.totalTests ? Math.round((status.completed / status.totalTests) * 100) : 0;
-            testFill.style.width = progress + '%';
-            testStatus.textContent = 'Testing configuration ' + status.completed + '/' + status.totalTests + ' (' + progress + '%)';
-
-            if (status.status === 'completed') {
-              clearInterval(testTimer);
-              showOptimalSettings(status.results);
-              testRunBtn.disabled = false;
-              testRunBtn.textContent = 'Test Run (Find Best Settings)';
-            } else if (status.status === 'error') {
-              clearInterval(testTimer);
-              testStatus.textContent = 'Test failed: ' + status.error;
-              testRunBtn.disabled = false;
-              testRunBtn.textContent = 'Test Run (Find Best Settings)';
-            }
-          } catch (error) {
-            clearInterval(testTimer);
-            testStatus.textContent = 'Test failed: ' + error.message;
-            testRunBtn.disabled = false;
-            testRunBtn.textContent = 'Test Run (Find Best Settings)';
-          }
-        }, 1000);
-      }
-
-      function showOptimalSettings(results) {
-        console.log('showOptimalSettings called with:', results);
-        const best = results.best;
-        
-        if (!best) {
-          testStatus.textContent = 'Test completed but no optimal settings found. Try different settings manually.';
-          console.log('No best configuration found in results');
-          return;
-        }
-        
-        console.log('Best configuration:', best);
-        document.getElementById('optDelay').textContent = best.delay || 'N/A';
-        document.getElementById('optConc').textContent = best.concurrency || 'N/A';
-        document.getElementById('optSpeed').textContent = (best.requestsPerSecond || 0).toFixed(1);
-        document.getElementById('optSuccess').textContent = (best.successRate || 0).toFixed(1);
-        
-        testStatus.textContent = 'Test completed! Found optimal settings for ' + (best.requestsPerSecond || 0).toFixed(1) + ' req/s';
-        optimalSettings.style.display = 'block';
-      }
-
-      function applyOptimalSettings() {
-        const optDelay = document.getElementById('optDelay').textContent;
-        const optConc = document.getElementById('optConc').textContent;
-        
-        form.querySelector('input[name="delay"]').value = optDelay;
-        form.querySelector('input[name="conc"]').value = optConc;
-        
-        // Update rate info display
-        updateRateInfo();
-        
-        testResults.style.display = 'none';
-        alert('Optimal settings applied! You can now start the scrape.');
-      }
     </script>
     `,
     req
@@ -1394,6 +1278,7 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
     };
     scrapeJobs.set(jobId, job);
     activeScrapeJob = jobId; // Mark as active
+    jobCancelled = false; // Reset cancellation flag
 
     // background worker with improved concurrency
     (async () => {
@@ -1405,7 +1290,18 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       const batchSize = Math.max(1, Math.floor(job.conc * 2));
       
       const processBatch = async (batch) => {
+        // Check for cancellation before processing batch
+        if (jobCancelled || job.status === 'cancelled') {
+          console.log('Job cancelled, stopping batch processing');
+          return;
+        }
+        
         const promises = batch.map(async (username) => {
+          // Check for cancellation before each request
+          if (jobCancelled || job.status === 'cancelled') {
+            return;
+          }
+          
           const globalIndex = usernameToIndex.get(username);
           const wasCached = requestCache.has(username.toLowerCase());
           
@@ -1450,6 +1346,15 @@ app.post('/scrape/start', upload.single('file'), async (req, res) => {
       try {
         // Process in batches
         for (let i = 0; i < queue.length; i += batchSize) {
+          // Check for cancellation before each batch
+          if (jobCancelled || job.status === 'cancelled') {
+            console.log('Job cancelled, stopping main processing loop');
+            job.status = 'cancelled';
+            job.error = 'Cancelled by user';
+            activeScrapeJob = null;
+            return;
+          }
+          
           const batch = queue.slice(i, i + batchSize);
           await processBatch(batch);
           
@@ -1542,6 +1447,7 @@ app.post('/scrape/cancel', (req, res) => {
     if (job && job.status === 'running') {
       job.status = 'cancelled';
       job.error = 'Cancelled by user';
+      jobCancelled = true; // Set flag to stop background processing
       activeScrapeJob = null;
       console.log('Scraping job cancelled by user');
       res.json({ ok: true, message: 'Job cancelled' });
@@ -1551,6 +1457,28 @@ app.post('/scrape/cancel', (req, res) => {
   } else {
     res.json({ ok: false, error: 'No active job to cancel' });
   }
+});
+
+app.post('/scrape/clear-all', (req, res) => {
+  // Cancel active job
+  if (activeScrapeJob) {
+    const job = scrapeJobs.get(activeScrapeJob);
+    if (job) {
+      job.status = 'cancelled';
+      job.error = 'Cleared by user';
+    }
+  }
+  
+  // Clear all jobs
+  scrapeJobs.clear();
+  activeScrapeJob = null;
+  jobCancelled = false; // Reset flag for fresh start
+  
+  // Clear request cache to start fresh
+  requestCache.clear();
+  
+  console.log('All jobs cleared and cache reset');
+  res.json({ ok: true, message: 'All jobs cleared and API cache reset' });
 });
 
 app.get('/scrape/active', (req, res) => {
@@ -1574,221 +1502,7 @@ app.get('/scrape/active', (req, res) => {
   }
 });
 
-// ===== Test Run Endpoints =====
-app.post('/scrape/test-run', upload.single('file'), async (req, res) => {
-  try {
-    if (!req.file) return res.json({ ok: false, error: 'No file uploaded' });
 
-    const content = req.file.buffer.toString('utf8');
-    const usernames = content.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-    if (!usernames.length) return res.json({ ok: false, error: 'Empty file' });
-
-    // Remove duplicates and take first 10 for testing
-    const uniqueUsernames = [...new Set(usernames.map(u => u.toLowerCase()))].slice(0, 10);
-    
-    const testId = crypto.randomBytes(8).toString('hex');
-    const testJob = {
-      status: 'running',
-      completed: 0,
-      totalTests: 0,
-      results: [],
-      error: null,
-      usernames: uniqueUsernames
-    };
-    testJobs.set(testId, testJob);
-
-    // Start test run in background
-    (async () => {
-      try {
-        await runPerformanceTests(testId, uniqueUsernames);
-      } catch (e) {
-        testJob.status = 'error';
-        testJob.error = e.message;
-        console.error('Test run failed:', e);
-      }
-    })();
-
-    res.json({ ok: true, testId });
-  } catch (e) {
-    res.json({ ok: false, error: e.message });
-  }
-});
-
-app.get('/scrape/test-status', (req, res) => {
-  const testId = (req.query.testId || '').trim();
-  const testJob = testJobs.get(testId);
-  if (!testJob) return res.json({ ok: false, error: 'Test not found' });
-
-  res.json({
-    ok: true,
-    status: testJob.status,
-    completed: testJob.completed,
-    totalTests: testJob.totalTests,
-    results: testJob.results,
-    error: testJob.error
-  });
-});
-
-async function runPerformanceTests(testId, usernames) {
-  const testJob = testJobs.get(testId);
-  
-  // First, test basic API connectivity with a simple request
-  console.log('Testing API connectivity...');
-  const fallbackUsernames = ['instagram', 'cristiano', 'therock', 'selenagomez', 'kyliejenner'];
-  let testUsernames = usernames;
-  
-  try {
-    const testUsername = usernames[0] || 'instagram';
-    await fetchProfile(testUsername, 1); // Single retry for connectivity test
-    console.log('API connectivity test passed with uploaded usernames');
-  } catch (e) {
-    console.log('Uploaded usernames failed, trying fallback usernames...');
-    try {
-      await fetchProfile('instagram', 1);
-      testUsernames = fallbackUsernames; // Use fallback usernames
-      console.log('API connectivity test passed with fallback usernames');
-    } catch (e2) {
-      console.error('API connectivity test failed:', e2.message);
-      testJob.status = 'error';
-      testJob.error = `API connectivity failed: ${e2.message}. Check your RAPIDAPI_KEY and network connection.`;
-      return;
-    }
-  }
-  
-  // Test configurations optimized for 30 req/s rate limit: [delay, concurrency]
-  const testConfigs = [
-    // Conservative settings (well under rate limit)
-    [100, 1], [100, 2], [100, 3],
-    [150, 1], [150, 2], [150, 3], [150, 4],
-    [200, 1], [200, 2], [200, 3], [200, 4], [200, 5],
-    [300, 1], [300, 2], [300, 3], [300, 4], [300, 5], [300, 6],
-    [500, 1], [500, 2], [500, 3], [500, 4], [500, 5], [500, 6]
-  ];
-
-  testJob.totalTests = testConfigs.length;
-  testJob.results = [];
-
-  for (let i = 0; i < testConfigs.length; i++) {
-    const [delay, concurrency] = testConfigs[i];
-    testJob.completed = i;
-    
-    try {
-      const result = await testConfiguration(testUsernames, delay, concurrency);
-      testJob.results.push({
-        delay,
-        concurrency,
-        ...result
-      });
-      
-      // Small delay between tests
-      await sleep(1000);
-    } catch (e) {
-      console.error(`Test config [${delay}ms, ${concurrency} workers] failed:`, e.message);
-      testJob.results.push({
-        delay,
-        concurrency,
-        requestsPerSecond: 0,
-        successRate: 0,
-        errorRate: 100,
-        avgResponseTime: 0,
-        errors: [e.message]
-      });
-    }
-  }
-
-  // Find best configuration
-  const validResults = testJob.results.filter(r => r.successRate > 0);
-  console.log(`Test run completed. Valid results: ${validResults.length}/${testJob.results.length}`);
-  
-  // Log detailed error information
-  const failedResults = testJob.results.filter(r => r.successRate === 0);
-  if (failedResults.length > 0) {
-    console.log('Failed configurations:', failedResults.map(r => ({
-      delay: r.delay,
-      concurrency: r.concurrency,
-      errors: r.errors
-    })));
-  }
-  
-  if (validResults.length === 0) {
-    testJob.status = 'error';
-    const errorSummary = failedResults.length > 0 ? 
-      `All test configurations failed. Common errors: ${[...new Set(failedResults.flatMap(r => r.errors))].join(', ')}` :
-      'All test configurations failed';
-    testJob.error = errorSummary;
-    console.log('All test configurations failed:', errorSummary);
-    return;
-  }
-
-  // Score based on success rate and speed
-  const scoredResults = validResults.map(r => ({
-    ...r,
-    score: (r.successRate / 100) * r.requestsPerSecond
-  }));
-
-  scoredResults.sort((a, b) => b.score - a.score);
-  testJob.best = scoredResults[0];
-  testJob.results.best = scoredResults[0]; // Also add to results for frontend
-  testJob.status = 'completed';
-  testJob.completed = testJob.totalTests;
-  
-  console.log('Best configuration found:', testJob.best);
-}
-
-async function testConfiguration(usernames, delay, concurrency) {
-  const startTime = Date.now();
-  const results = [];
-  const errors = [];
-  
-  // Test with first 5 usernames
-  const testUsernames = usernames.slice(0, 5);
-  console.log(`Testing config: delay=${delay}ms, concurrency=${concurrency}, usernames=${testUsernames.length}`);
-  
-  const processBatch = async (batch) => {
-    const promises = batch.map(async (username) => {
-      const requestStart = Date.now();
-      try {
-        const profile = await fetchProfile(username, 2); // Only 2 retries for testing
-        const responseTime = Date.now() - requestStart;
-        results.push({ username, success: true, responseTime });
-        return { success: true, responseTime };
-      } catch (e) {
-        const responseTime = Date.now() - requestStart;
-        errors.push(e.message);
-        results.push({ username, success: false, responseTime, error: e.message });
-        return { success: false, responseTime, error: e.message };
-      }
-    });
-    
-    await Promise.allSettled(promises);
-    
-    // Add delay between requests
-    if (delay > 0) {
-      await sleep(delay);
-    }
-  };
-
-  // Process in batches
-  const batchSize = Math.max(1, Math.floor(concurrency));
-  for (let i = 0; i < testUsernames.length; i += batchSize) {
-    const batch = testUsernames.slice(i, i + batchSize);
-    await processBatch(batch);
-  }
-
-  const duration = Math.max((Date.now() - startTime) / 1000, 0.1); // Prevent division by zero
-  const successful = results.filter(r => r.success).length;
-  const successRate = results.length > 0 ? (successful / results.length) * 100 : 0;
-  const requestsPerSecond = results.length / duration;
-  const avgResponseTime = results.length > 0 ? results.reduce((sum, r) => sum + r.responseTime, 0) / results.length : 0;
-
-  return {
-    requestsPerSecond: Math.round(requestsPerSecond * 10) / 10,
-    successRate: Math.round(successRate * 10) / 10,
-    errorRate: Math.round((100 - successRate) * 10) / 10,
-    avgResponseTime: Math.round(avgResponseTime),
-    errors: [...new Set(errors)] // Unique errors
-  };
-}
 
 // ===== Revert last actions (per VA shows their own 10) =====
 app.get('/revert', async (req, res) => {
