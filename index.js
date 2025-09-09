@@ -33,7 +33,6 @@ const {
 const RAPIDAPI_KEY = process.env.RAPIDAPI_KEY;
 const RAPIDAPI_HOST = process.env.RAPIDAPI_HOST || 'instagram-looter2.p.rapidapi.com';
 const SCRAPE_CONCURRENCY = parseInt(process.env.SCRAPE_CONCURRENCY || '4', 10);
-const SCRAPE_DELAY_MS = parseInt(process.env.SCRAPE_DELAY_MS || '135', 10); // Updated default delay from 180ms to 135ms
 
 const IS_PROD = NODE_ENV === 'production';
 
@@ -927,7 +926,7 @@ app.get('/scrape', (req, res) => {
         <label>Upload a .txt with one Instagram username per line</label>
         <input type="file" name="file" accept=".txt" required />
         <div class="row">
-          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="${SCRAPE_DELAY_MS}"/></div>
+          <div><label>Delay per request (ms)</label><input type="number" name="delay" min="0" value="135"/></div>
           <div><label>Concurrency</label><input type="number" name="conc" min="1" max="5" value="${SCRAPE_CONCURRENCY}"/></div>
         </div>
         <button type="submit">Start Scrape</button>
@@ -996,7 +995,7 @@ app.get('/scrape', (req, res) => {
 app.post('/scrape/start', upload.single('file'), async (req, res) => {
   try {
     if (!req.file) return res.json({ ok:false, error:'No file uploaded' });
-    const delay = Math.max(0, parseInt(req.body.delay || SCRAPE_DELAY_MS, 10));
+    const delay = Math.max(0, parseInt(req.body.delay || '135', 10));
     const conc = Math.max(1, Math.min(parseInt(req.body.conc || SCRAPE_CONCURRENCY, 10), 5));
 
     const content = req.file.buffer.toString('utf8');
